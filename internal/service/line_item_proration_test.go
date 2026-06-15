@@ -17,8 +17,8 @@ import (
 
 // LineItemProrationServiceSuite tests the LineItemProrationService in isolation
 // using in-memory repositories. It focuses on:
-//   1. Compute – pure math correctness (no side effects)
-//   2. Apply   – Compute + settle (invoice creation / wallet credit)
+//  1. Compute – pure math correctness (no side effects)
+//  2. Apply   – Compute + settle (invoice creation / wallet credit)
 type LineItemProrationServiceSuite struct {
 	testutil.BaseServiceTestSuite
 	svc LineItemProrationService
@@ -77,7 +77,7 @@ func (s *LineItemProrationServiceSuite) setupService() {
 		CouponRepo:                 s.GetStores().CouponRepo,
 		CouponAssociationRepo:      s.GetStores().CouponAssociationRepo,
 		CouponApplicationRepo:      s.GetStores().CouponApplicationRepo,
-		AddonRepo:                  testutil.NewInMemoryAddonStore(),
+		AddonRepo:                  s.GetStores().AddonRepo,
 		AddonAssociationRepo:       s.GetStores().AddonAssociationRepo,
 		ConnectionRepo:             s.GetStores().ConnectionRepo,
 		SettingsRepo:               s.GetStores().SettingsRepo,
@@ -420,9 +420,9 @@ func (s *LineItemProrationServiceSuite) TestCompute_MultipleEntries_AddAndRemove
 		Behavior:      types.ProrationBehaviorCreateProrations,
 		Entries: []LineItemProrationEntry{
 			{
-				LineItem:    s.td.lineItem,
-				Price:       s.td.fixedPrice,
-				Action:      types.ProrationActionRemoveItem,
+				LineItem: s.td.lineItem,
+				Price:    s.td.fixedPrice,
+				Action:   types.ProrationActionRemoveItem,
 			},
 			{
 				LineItem:    &addItem,

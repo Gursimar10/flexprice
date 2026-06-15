@@ -2,6 +2,7 @@ package subscription
 
 import (
 	"context"
+	"time"
 
 	"github.com/flexprice/flexprice/internal/types"
 )
@@ -27,8 +28,12 @@ type Repository interface {
 	GetWithPauses(ctx context.Context, id string) (*Subscription, []*SubscriptionPause, error)
 
 	// Renewal due alert methods
-	ListSubscriptionsDueForRenewal(ctx context.Context) ([]*Subscription, error)
+	ListSubscriptionsDueForRenewal(ctx context.Context, referenceTime time.Time) ([]*Subscription, error)
 
 	// Dashboard methods
 	GetRecentSubscriptionsByPlan(ctx context.Context) ([]types.SubscriptionPlanCount, error)
+
+	// GetSubscriptionsWithAutoInvoiceThreshold returns active, published subscriptions (paginated)
+	// where auto_invoice_threshold is set on the subscription (non-nil and > 0).
+	GetSubscriptionsWithAutoInvoiceThreshold(ctx context.Context, limit, offset int) ([]*Subscription, error)
 }

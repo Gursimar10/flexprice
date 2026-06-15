@@ -19,6 +19,7 @@ const (
 	ConnectionMetadataTypeMoyasar   ConnectionMetadataType = "moyasar"
 	ConnectionMetadataTypePaddle    ConnectionMetadataType = "paddle"
 	ConnectionMetadataTypeZohoBooks ConnectionMetadataType = "zoho_books"
+	ConnectionMetadataTypeWhop      ConnectionMetadataType = "whop"
 )
 
 func (t ConnectionMetadataType) Validate() error {
@@ -33,10 +34,11 @@ func (t ConnectionMetadataType) Validate() error {
 		ConnectionMetadataTypeMoyasar,
 		ConnectionMetadataTypePaddle,
 		ConnectionMetadataTypeZohoBooks,
+		ConnectionMetadataTypeWhop,
 	}
 	if !lo.Contains(allowedTypes, t) {
 		return ierr.NewError("invalid connection metadata type").
-			WithHint("Connection metadata type must be one of: stripe, generic, s3, hubspot, razorpay, chargebee, nomod, moyasar, paddle, zoho_books").
+			WithHint("Connection metadata type must be one of: stripe, generic, s3, hubspot, razorpay, chargebee, nomod, moyasar, paddle, zoho_books, whop").
 			Mark(ierr.ErrValidation)
 	}
 	return nil
@@ -231,27 +233,27 @@ func (m *MoyasarConnectionMetadata) Validate() error {
 
 // PaddleConnectionMetadata represents Paddle-specific connection metadata
 type PaddleConnectionMetadata struct {
-	APIKey          string `json:"api_key"`            // Paddle API Key (encrypted)
-	WebhookSecret   string `json:"webhook_secret"`     // Paddle webhook secret (encrypted)
-	ClientSideToken string `json:"client_side_token"`  // Paddle.js client-side token (optional, encrypted)
+	APIKey          string `json:"api_key"`           // Paddle API Key (encrypted)
+	WebhookSecret   string `json:"webhook_secret"`    // Paddle webhook secret (encrypted)
+	ClientSideToken string `json:"client_side_token"` // Paddle.js client-side token (optional, encrypted)
 }
 
 // ZohoBooksConnectionMetadata represents Zoho Books OAuth connection metadata
 type ZohoBooksConnectionMetadata struct {
-	ClientID     string `json:"client_id"`                    // OAuth Client ID (encrypted)
-	ClientSecret string `json:"client_secret"`                // OAuth Client Secret (encrypted)
-	RefreshToken string `json:"refresh_token,omitempty"`       // OAuth Refresh Token (encrypted)
-	AccessToken  string `json:"access_token,omitempty"`        // OAuth Access Token (encrypted cache)
-	AuthCode     string `json:"auth_code,omitempty"`           // OAuth Authorization Code (temporary, encrypted)
-	RedirectURI  string `json:"redirect_uri,omitempty"`        // OAuth Redirect URI
-	APIDomain    string `json:"api_domain,omitempty"`          // Zoho API domain from token exchange
-	AccountsURL  string `json:"accounts_server,omitempty"`     // Zoho Accounts base URL / DC
-	Location     string `json:"location,omitempty"`            // Zoho account location/DC hint
-	OrganizationID   string `json:"organization_id,omitempty"`   // Selected Zoho Books organization
-	OrganizationName string `json:"organization_name,omitempty"` // Selected organization name
-	Scopes           string `json:"scopes,omitempty"`            // Granted scopes, comma-separated
+	ClientID             string `json:"client_id"`                         // OAuth Client ID (encrypted)
+	ClientSecret         string `json:"client_secret"`                     // OAuth Client Secret (encrypted)
+	RefreshToken         string `json:"refresh_token,omitempty"`           // OAuth Refresh Token (encrypted)
+	AccessToken          string `json:"access_token,omitempty"`            // OAuth Access Token (encrypted cache)
+	AuthCode             string `json:"auth_code,omitempty"`               // OAuth Authorization Code (temporary, encrypted)
+	RedirectURI          string `json:"redirect_uri,omitempty"`            // OAuth Redirect URI
+	APIDomain            string `json:"api_domain,omitempty"`              // Zoho API domain from token exchange
+	AccountsURL          string `json:"accounts_server,omitempty"`         // Zoho Accounts base URL / DC
+	Location             string `json:"location,omitempty"`                // Zoho account location/DC hint
+	OrganizationID       string `json:"organization_id,omitempty"`         // Selected Zoho Books organization
+	OrganizationName     string `json:"organization_name,omitempty"`       // Selected organization name
+	Scopes               string `json:"scopes,omitempty"`                  // Granted scopes, comma-separated
 	AccessTokenExpiresAt string `json:"access_token_expires_at,omitempty"` // RFC3339 expiry timestamp
-	OAuthSessionData string `json:"oauth_session_data,omitempty"` // Temporary encrypted session data
+	OAuthSessionData     string `json:"oauth_session_data,omitempty"`      // Temporary encrypted session data
 	// WebhookSecret is the Zoho Books webhook signing secret (encrypted at rest). Optional until inbound webhooks are configured.
 	WebhookSecret string `json:"webhook_secret,omitempty"`
 }
@@ -321,6 +323,28 @@ func (s *StripeConnectionMetadata) Validate() error {
 	return nil
 }
 
+// WhopConnectionMetadata represents Whop-specific connection metadata
+type WhopConnectionMetadata struct {
+	APIKey    string `json:"api_key"`              // Whop API key / Bearer token (encrypted)
+	CompanyID string `json:"company_id"`           // Whop company ID (biz_...)
+	ProductID string `json:"product_id,omitempty"` // Whop product ID (prod_...) - created on first sync if empty
+}
+
+// Validate validates the Whop connection metadata
+func (w *WhopConnectionMetadata) Validate() error {
+	if w.APIKey == "" {
+		return ierr.NewError("api_key is required").
+			WithHint("Whop API key is required").
+			Mark(ierr.ErrValidation)
+	}
+	if w.CompanyID == "" {
+		return ierr.NewError("company_id is required").
+			WithHint("Whop company ID is required").
+			Mark(ierr.ErrValidation)
+	}
+	return nil
+}
+
 // GenericConnectionMetadata represents generic connection metadata
 type GenericConnectionMetadata struct {
 	Data map[string]interface{} `json:"data"`
@@ -348,6 +372,7 @@ type ConnectionMetadata struct {
 	Moyasar    *MoyasarConnectionMetadata    `json:"moyasar,omitempty"`
 	Paddle     *PaddleConnectionMetadata     `json:"paddle,omitempty"`
 	ZohoBooks  *ZohoBooksConnectionMetadata  `json:"zoho_books,omitempty"`
+	Whop       *WhopConnectionMetadata       `json:"whop,omitempty"`
 	Generic    *GenericConnectionMetadata    `json:"generic,omitempty"`
 	Settings   *ConnectionSettings           `json:"settings,omitempty"`
 }
@@ -425,6 +450,13 @@ func (c *ConnectionMetadata) Validate(providerType SecretProvider) error {
 				Mark(ierr.ErrValidation)
 		}
 		return c.ZohoBooks.Validate()
+	case SecretProviderWhop:
+		if c.Whop == nil {
+			return ierr.NewError("whop metadata is required").
+				WithHint("Whop metadata is required for whop provider").
+				Mark(ierr.ErrValidation)
+		}
+		return c.Whop.Validate()
 	default:
 		// For other providers or unknown types, use generic format
 		if c.Generic == nil {

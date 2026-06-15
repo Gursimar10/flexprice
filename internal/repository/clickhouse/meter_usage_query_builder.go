@@ -106,7 +106,62 @@ func (qb *MeterUsageQueryBuilder) BuildWhereClause(params *events.MeterUsageQuer
 		conditions = append(conditions, "unique_hash != ''")
 	}
 
+	// Source filter
+	if clause, addArgs := buildSourceFilterClause(params.Sources); clause != "" {
+		conditions = append(conditions, clause)
+		args = append(args, addArgs...)
+	}
+
+	// Property filters
+	if clauses, addArgs := buildPropertyFilterClauses(params.PropertyFilters); len(clauses) > 0 {
+		conditions = append(conditions, clauses...)
+		args = append(args, addArgs...)
+	}
+
 	return strings.Join(conditions, " AND "), args
+}
+
+// buildSourceFilterClause builds the "source IN (?, ?, …)" fragment.
+// Returns ("", nil) when sources is empty.
+func buildSourceFilterClause(sources []string) (string, []interface{}) {
+	if len(sources) == 0 {
+		return "", nil
+	}
+	placeholders := make([]string, len(sources))
+	args := make([]interface{}, 0, len(sources))
+	for i, src := range sources {
+		placeholders[i] = "?"
+		args = append(args, src)
+	}
+	return fmt.Sprintf("source IN (%s)", strings.Join(placeholders, ", ")), args
+}
+
+// buildPropertyFilterClauses builds JSONExtractString filter fragments. First clause
+// is "properties != ”" so the JSON extracts work; remaining clauses are per-property
+// equality (one value) or IN (multi-value). Returns (nil, nil) for empty filters.
+func buildPropertyFilterClauses(filters map[string][]string) ([]string, []interface{}) {
+	if len(filters) == 0 {
+		return nil, nil
+	}
+	clauses := make([]string, 0, len(filters))
+	args := make([]interface{}, 0, len(filters))
+	for property, values := range filters {
+		if len(values) == 1 {
+			clauses = append(clauses, "JSONExtractString(properties, ?) = ?")
+			args = append(args, property, values[0])
+		} else if len(values) > 1 {
+			placeholders := make([]string, len(values))
+			for i := range values {
+				placeholders[i] = "?"
+			}
+			clauses = append(clauses, fmt.Sprintf("JSONExtractString(properties, ?) IN (%s)", strings.Join(placeholders, ",")))
+			args = append(args, property)
+			for _, v := range values {
+				args = append(args, v)
+			}
+		}
+	}
+	return clauses, args
 }
 
 // BuildFinalClause returns FINAL keyword and SETTINGS for ReplacingMergeTree dedup
@@ -200,6 +255,161 @@ func (qb *MeterUsageQueryBuilder) BuildBucketedQuery(params *events.MeterUsageQu
 		bucketColumnName,
 		bucketTableName,
 		settings)
+
+	return query, args
+}
+
+// BuildDetailedWhereClause constructs WHERE conditions for detailed analytics queries.
+// Extends the base where clause with source filtering and property filters.
+func (qb *MeterUsageQueryBuilder) BuildDetailedWhereClause(params *events.MeterUsageDetailedAnalyticsParams) (string, []interface{}) {
+	conditions := make([]string, 0, 10)
+	args := make([]interface{}, 0, 10)
+
+	// Tenant scope
+	conditions = append(conditions, "tenant_id = ?")
+	args = append(args, params.TenantID)
+
+	conditions = append(conditions, "environment_id = ?")
+	args = append(args, params.EnvironmentID)
+
+	// Customer filter
+	if params.ExternalCustomerID != "" {
+		conditions = append(conditions, "external_customer_id = ?")
+		args = append(args, params.ExternalCustomerID)
+	} else if len(params.ExternalCustomerIDs) > 0 {
+		placeholders := make([]string, len(params.ExternalCustomerIDs))
+		for i, id := range params.ExternalCustomerIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		conditions = append(conditions, fmt.Sprintf("external_customer_id IN (%s)", strings.Join(placeholders, ", ")))
+	}
+
+	// Meter filter
+	if len(params.MeterIDs) > 0 {
+		placeholders := make([]string, len(params.MeterIDs))
+		for i, id := range params.MeterIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		conditions = append(conditions, fmt.Sprintf("meter_id IN (%s)", strings.Join(placeholders, ", ")))
+	}
+
+	// Time range
+	if !params.StartTime.IsZero() {
+		conditions = append(conditions, "timestamp >= ?")
+		args = append(args, params.StartTime.UTC())
+	}
+	if !params.EndTime.IsZero() {
+		conditions = append(conditions, "timestamp < ?")
+		args = append(args, params.EndTime.UTC())
+	}
+
+	// Source filter
+	if clause, addArgs := buildSourceFilterClause(params.Sources); clause != "" {
+		conditions = append(conditions, clause)
+		args = append(args, addArgs...)
+	}
+
+	// Property filters
+	if clauses, addArgs := buildPropertyFilterClauses(params.PropertyFilters); len(clauses) > 0 {
+		conditions = append(conditions, clauses...)
+		args = append(args, addArgs...)
+	}
+
+	return strings.Join(conditions, " AND "), args
+}
+
+// DetailedGroupByResult holds the parsed group-by configuration for detailed analytics queries.
+type DetailedGroupByResult struct {
+	// Columns are the raw SQL expressions used in the GROUP BY clause
+	Columns []string
+	// Aliases are the SELECT expressions (with AS aliases for properties)
+	Aliases []string
+	// FieldMapping maps the original group-by field name to its column alias
+	FieldMapping map[string]string
+}
+
+// BuildDetailedGroupByColumns parses and validates group-by fields, returning SQL columns and aliases.
+func (qb *MeterUsageQueryBuilder) BuildDetailedGroupByColumns(params *events.MeterUsageDetailedAnalyticsParams) (*DetailedGroupByResult, error) {
+	result := &DetailedGroupByResult{
+		Columns:      make([]string, 0, len(params.GroupBy)),
+		Aliases:      make([]string, 0, len(params.GroupBy)),
+		FieldMapping: make(map[string]string),
+	}
+
+	for _, groupBy := range params.GroupBy {
+		switch {
+		case groupBy == "meter_id":
+			result.Columns = append(result.Columns, "meter_id")
+			result.Aliases = append(result.Aliases, "meter_id")
+			result.FieldMapping["meter_id"] = "meter_id"
+		case groupBy == "source":
+			result.Columns = append(result.Columns, "source")
+			result.Aliases = append(result.Aliases, "source")
+			result.FieldMapping["source"] = "source"
+		case strings.HasPrefix(groupBy, "properties."):
+			propertyName := strings.TrimPrefix(groupBy, "properties.")
+			if propertyName == "" || !validMeterUsageGroupByPattern.MatchString(propertyName) {
+				return nil, fmt.Errorf("invalid property name in group_by: %s", groupBy)
+			}
+			alias := "prop_" + strings.ReplaceAll(propertyName, ".", "_")
+			jsonExpr := fmt.Sprintf("JSONExtractString(properties, '%s')", propertyName)
+			result.Columns = append(result.Columns, jsonExpr)
+			result.Aliases = append(result.Aliases, fmt.Sprintf("%s AS %s", jsonExpr, alias))
+			result.FieldMapping[groupBy] = alias
+		default:
+			return nil, fmt.Errorf("invalid group_by value: %s (allowed: meter_id, source, properties.<field>)", groupBy)
+		}
+	}
+
+	return result, nil
+}
+
+// BuildDetailedPointsQuery constructs a time-series sub-query for a single group's analytics points.
+func (qb *MeterUsageQueryBuilder) BuildDetailedPointsQuery(
+	params *events.MeterUsageDetailedAnalyticsParams,
+	result *events.MeterUsageDetailedResult,
+	groupByResult *DetailedGroupByResult,
+) (string, []interface{}) {
+	windowExpr := formatWindowSizeWithBillingAnchor(params.WindowSize, params.BillingAnchor)
+	if windowExpr == "" {
+		return "", nil
+	}
+
+	aggColumns := buildMeterUsageAggregationColumns(params.AggregationTypes)
+	finalClause, settings := qb.BuildFinalClause(params.UseFinal)
+
+	// Start with the base WHERE from the detailed params
+	where, args := qb.BuildDetailedWhereClause(params)
+
+	// Narrow to this specific group
+	if result.MeterID != "" {
+		where += " AND meter_id = ?"
+		args = append(args, result.MeterID)
+	}
+	if result.Source != "" {
+		where += " AND source = ?"
+		args = append(args, result.Source)
+	}
+	for propName, propValue := range result.Properties {
+		if propValue != "" {
+			where += " AND JSONExtractString(properties, ?) = ?"
+			args = append(args, propName, propValue)
+		}
+	}
+
+	selectCols := append([]string{fmt.Sprintf("%s AS window_start", windowExpr)}, aggColumns...)
+
+	query := fmt.Sprintf(`
+		SELECT
+			%s
+		FROM meter_usage %s
+		WHERE %s
+		GROUP BY window_start
+		ORDER BY window_start ASC
+		%s
+	`, strings.Join(selectCols, ",\n\t\t\t"), finalClause, where, settings)
 
 	return query, args
 }

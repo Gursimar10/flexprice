@@ -266,6 +266,21 @@ func (Price) Fields() []ent.Field {
 			}).
 			Optional().
 			Nillable(),
+
+		// Monotonic sequence stamped on every plan-price state change that
+		// subscriptions need to react to (create, end_date set, compat edit).
+		// Used by the plan-price sync to find prices changed since each
+		// subscription's last reconciliation.
+		//
+		// Declared as `bigserial` so Atlas's introspector and the schema agree
+		// on the column being serial-backed — otherwise the diff produces a
+		// spurious DROP SEQUENCE that fails because the column still depends
+		// on it. The sequence is also pre-created by V4_prices_sequence.up.sql
+		// for first-time setups where `migrate-postgres` runs before `migrate-ent`.
+		field.Int64("sequence").
+			SchemaType(map[string]string{
+				"postgres": "bigserial",
+			}),
 	}
 }
 
@@ -289,5 +304,8 @@ func (Price) Indexes() []ent.Index {
 		index.Fields("tenant_id", "environment_id"),
 		index.Fields("start_date", "end_date"),
 		index.Fields("tenant_id", "environment_id", "group_id"),
+		// To get "what changed since the sub's last synced_price_sequence"
+		index.Fields("tenant_id", "environment_id", "entity_id", "entity_type", "sequence").
+			Annotations(entsql.IndexWhere("status = 'published'")),
 	}
 }

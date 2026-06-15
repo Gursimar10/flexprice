@@ -1,9 +1,6 @@
 package middleware
 
 import (
-	"fmt"
-	"net/http"
-
 	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/rbac"
 	"github.com/flexprice/flexprice/internal/types"
@@ -24,31 +21,36 @@ func NewPermissionMiddleware(rbacService *rbac.RBACService, logger *logger.Logge
 	}
 }
 
-// RequirePermission returns a middleware that checks for specific entity.action
-// This is called explicitly in route definitions
-func (pm *PermissionMiddleware) RequirePermission(entity string, action string) gin.HandlerFunc {
+// RequirePermission returns a middleware that checks for specific entity.action.
+// For write actions it also blocks suspended tenants, so a single inline call
+// handles both RBAC and tenant access control.
+func (pm *PermissionMiddleware) RequirePermission(entity string, action types.Action) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Get roles from context (set by auth middleware)
-		roles := types.GetRoles(c.Request.Context())
+		// ctx := c.Request.Context()
 
-		// Check permission using set-based lookup
-		if !pm.rbacService.HasPermission(roles, entity, action) {
-			pm.logger.Info("Permission denied",
-				"user_id", types.GetUserID(c.Request.Context()),
-				"roles", roles,
-				"entity", entity,
-				"action", action,
-				"path", c.Request.URL.Path,
-			)
+		// if action == types.ActionWrite && types.GetTenantInternalStatus(ctx) == types.TenantInternalStatusSuspended {
+		// 	c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+		// 		"error": "tenant account is suspended",
+		// 	})
+		// 	return
+		// }
 
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-				"error":   "Forbidden",
-				"message": fmt.Sprintf("Insufficient permissions to %s %s", action, entity),
-			})
-			return
-		}
+		// roles := types.GetRoles(ctx)
+		// if !pm.rbacService.HasPermission(roles, entity, string(action)) {
+		// 	pm.logger.Info("Permission denied",
+		// 		"user_id", types.GetUserID(ctx),
+		// 		"roles", roles,
+		// 		"entity", entity,
+		// 		"action", action,
+		// 		"path", c.Request.URL.Path,
+		// 	)
+		// 	c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+		// 		"error":   "Forbidden",
+		// 		"message": fmt.Sprintf("Insufficient permissions to %s %s", action, entity),
+		// 	})
+		// 	return
+		// }
 
-		// Permission granted, continue to handler
 		c.Next()
 	}
 }

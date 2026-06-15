@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -71,7 +72,7 @@ func (s *SubscriptionModificationServiceSuite) buildServiceParams() ServiceParam
 		CouponRepo:                 s.GetStores().CouponRepo,
 		CouponAssociationRepo:      s.GetStores().CouponAssociationRepo,
 		CouponApplicationRepo:      s.GetStores().CouponApplicationRepo,
-		AddonRepo:                  testutil.NewInMemoryAddonStore(),
+		AddonRepo:                  s.GetStores().AddonRepo,
 		AddonAssociationRepo:       s.GetStores().AddonAssociationRepo,
 		ConnectionRepo:             s.GetStores().ConnectionRepo,
 		SettingsRepo:               s.GetStores().SettingsRepo,
@@ -137,6 +138,37 @@ func (s *SubscriptionModificationServiceSuite) createActiveSub(customerID string
 	}
 	s.Require().NoError(s.GetStores().SubscriptionRepo.Create(ctx, sub))
 	return sub
+}
+
+// createParentSubWithChild creates a parent customer, a child customer, promotes the
+// parent subscription to type=parent, and creates a live inherited subscription for the child.
+// Returns (parentCustomer, childCustomer, parentSub, inheritedSub).
+func (s *SubscriptionModificationServiceSuite) createParentSubWithChild(parentExtID, childExtID string) (*customer.Customer, *customer.Customer, *subscription.Subscription, *subscription.Subscription) {
+	ctx := s.GetContext()
+
+	parent := s.createCustomer(parentExtID)
+	child := s.createCustomer(childExtID)
+	parentSub := s.createActiveSub(parent.ID)
+
+	_, err := s.service.Execute(ctx, parentSub.ID, dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeInheritance,
+		InheritanceParams: &dto.SubModifyInheritanceRequest{
+			ExternalCustomerIDsToInheritSubscription: []string{child.ExternalID},
+		},
+	})
+	s.Require().NoError(err)
+
+	filter := types.NewNoLimitSubscriptionFilter()
+	filter.CustomerID = child.ID
+	subs, err := s.GetStores().SubscriptionRepo.List(ctx, filter)
+	s.Require().NoError(err)
+	s.Require().Len(subs, 1)
+	inheritedSub := subs[0]
+
+	updatedParent, err := s.GetStores().SubscriptionRepo.Get(ctx, parentSub.ID)
+	s.Require().NoError(err)
+
+	return parent, child, updatedParent, inheritedSub
 }
 
 func (s *SubscriptionModificationServiceSuite) createFixedLineItem(subID, customerID string, qty decimal.Decimal, cadence types.InvoiceCadence) *subscription.SubscriptionLineItem {
@@ -596,6 +628,90 @@ func (s *SubscriptionModificationServiceSuite) TestExecuteInheritance_DuplicateC
 	s.Require().Error(err)
 }
 
+// TestExecuteInheritance_ChildHasStandaloneSubRejected verifies that a customer with an
+// existing standalone subscription cannot be added as a child via the modification path.
+func (s *SubscriptionModificationServiceSuite) TestExecuteInheritance_ChildHasStandaloneSubRejected() {
+	ctx := s.GetContext()
+
+	parent := s.createCustomer("ext-parent-standalone-guard")
+	child := s.createCustomer("ext-child-standalone-guard")
+
+	parentSub := s.createActiveSub(parent.ID)
+	// Child already has its own standalone subscription
+	_ = s.createActiveSub(child.ID)
+
+	_, err := s.service.Execute(ctx, parentSub.ID, dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeInheritance,
+		InheritanceParams: &dto.SubModifyInheritanceRequest{
+			ExternalCustomerIDsToInheritSubscription: []string{child.ExternalID},
+		},
+	})
+	s.Require().Error(err)
+	s.Contains(err.Error(), "standalone or parent subscriptions")
+}
+
+// TestExecuteInheritance_SameParentCanReInheritChild verifies that the SAME parent customer
+// CAN inherit the same child via a second subscription (different subscription, same parent customer).
+func (s *SubscriptionModificationServiceSuite) TestExecuteInheritance_SameParentCanReInheritChild() {
+	ctx := s.GetContext()
+
+	parent := s.createCustomer("ext-parent-reinherit-ok")
+	child := s.createCustomer("ext-child-reinherit-ok")
+
+	subA := s.createActiveSub(parent.ID)
+	subB := s.createActiveSub(parent.ID)
+
+	// subA inherits child — succeeds
+	_, err := s.service.Execute(ctx, subA.ID, dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeInheritance,
+		InheritanceParams: &dto.SubModifyInheritanceRequest{
+			ExternalCustomerIDsToInheritSubscription: []string{child.ExternalID},
+		},
+	})
+	s.Require().NoError(err)
+
+	// subB (same parent customer) also inherits same child — must also succeed
+	_, err = s.service.Execute(ctx, subB.ID, dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeInheritance,
+		InheritanceParams: &dto.SubModifyInheritanceRequest{
+			ExternalCustomerIDsToInheritSubscription: []string{child.ExternalID},
+		},
+	})
+	s.Require().NoError(err)
+}
+
+// TestExecuteInheritance_ChildAlreadyHasParentRejected verifies that a child customer
+// cannot be added under a second parent if it already has an active inherited subscription.
+func (s *SubscriptionModificationServiceSuite) TestExecuteInheritance_ChildAlreadyHasParentRejected() {
+	ctx := s.GetContext()
+
+	parentA := s.createCustomer("ext-parent-a-dup")
+	parentB := s.createCustomer("ext-parent-b-dup")
+	child := s.createCustomer("ext-child-dup")
+
+	subA := s.createActiveSub(parentA.ID)
+	subB := s.createActiveSub(parentB.ID)
+
+	// Parent A inherits child successfully
+	_, err := s.service.Execute(ctx, subA.ID, dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeInheritance,
+		InheritanceParams: &dto.SubModifyInheritanceRequest{
+			ExternalCustomerIDsToInheritSubscription: []string{child.ExternalID},
+		},
+	})
+	s.Require().NoError(err)
+
+	// Parent B tries to inherit the same child — must be rejected
+	_, err = s.service.Execute(ctx, subB.ID, dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeInheritance,
+		InheritanceParams: &dto.SubModifyInheritanceRequest{
+			ExternalCustomerIDsToInheritSubscription: []string{child.ExternalID},
+		},
+	})
+	s.Require().Error(err)
+	s.Contains(err.Error(), "already has a parent")
+}
+
 // TestExecuteInheritance_InheritedSubCannotAddChildren verifies that calling Execute on
 // an inherited subscription returns an error.
 func (s *SubscriptionModificationServiceSuite) TestExecuteInheritance_InheritedSubCannotAddChildren() {
@@ -633,6 +749,191 @@ func (s *SubscriptionModificationServiceSuite) TestExecuteInheritance_InheritedS
 		},
 	})
 	s.Require().Error(err)
+}
+
+func (s *SubscriptionModificationServiceSuite) TestExecuteInheritance_RejectedWhenParentHasAutoInvoiceThreshold() {
+	ctx := s.GetContext()
+
+	parent := s.createCustomer("ext-parent-thresh-guard")
+	child := s.createCustomer("ext-child-thresh-guard")
+	sub := s.createActiveSub(parent.ID)
+	th := decimal.RequireFromString("42")
+	sub.AutoInvoiceThreshold = &th
+	s.Require().NoError(s.GetStores().SubscriptionRepo.Update(ctx, sub))
+
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeInheritance,
+		InheritanceParams: &dto.SubModifyInheritanceRequest{
+			ExternalCustomerIDsToInheritSubscription: []string{child.ExternalID},
+		},
+	}
+
+	_, err := s.service.Execute(ctx, sub.ID, req)
+	s.Require().Error(err)
+	s.Contains(strings.ToLower(err.Error()), "auto_invoice_threshold")
+
+	_, err = s.service.Preview(ctx, sub.ID, req)
+	s.Require().Error(err)
+	s.Contains(strings.ToLower(err.Error()), "auto_invoice_threshold")
+}
+
+func (s *SubscriptionModificationServiceSuite) TestExecuteInheritance_AllowedWhenAutoInvoiceThresholdZero() {
+	ctx := s.GetContext()
+
+	parent := s.createCustomer("ext-parent-zero-thresh-ok")
+	child := s.createCustomer("ext-child-zero-thresh-ok")
+	sub := s.createActiveSub(parent.ID)
+	z := decimal.Zero
+	sub.AutoInvoiceThreshold = &z
+	s.Require().NoError(s.GetStores().SubscriptionRepo.Update(ctx, sub))
+
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeInheritance,
+		InheritanceParams: &dto.SubModifyInheritanceRequest{
+			ExternalCustomerIDsToInheritSubscription: []string{child.ExternalID},
+		},
+	}
+
+	_, err := s.service.Preview(ctx, sub.ID, req)
+	s.Require().NoError(err)
+
+	_, err = s.service.Execute(ctx, sub.ID, req)
+	s.Require().NoError(err)
+}
+
+// TestExecuteRemoveInheritance_Success verifies that a child's inherited subscription
+// gets cancel_at set to the parent's CurrentPeriodEnd and cancel_at_period_end=true,
+// while the parent stays as type=parent.
+func (s *SubscriptionModificationServiceSuite) TestExecuteRemoveInheritance_Success() {
+	ctx := s.GetContext()
+	_, child, parentSub, inheritedSub := s.createParentSubWithChild("ext-rp-001", "ext-rc-001")
+
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeInheritance,
+		InheritanceParams: &dto.SubModifyInheritanceRequest{
+			Action:                      dto.InheritanceActionRemove,
+			ExternalCustomerIDsToRemove: []string{child.ExternalID},
+		},
+	}
+
+	resp, err := s.service.Execute(ctx, parentSub.ID, req)
+	s.Require().NoError(err)
+	s.Require().NotNil(resp)
+
+	// One changed subscription: the inherited child marked for removal
+	s.Require().Len(resp.ChangedResources.Subscriptions, 1)
+	s.Equal(dto.ChangedSubscriptionActionUpdated, resp.ChangedResources.Subscriptions[0].Action)
+	s.Equal(inheritedSub.ID, resp.ChangedResources.Subscriptions[0].ID)
+
+	// Inherited sub should have cancel_at = parent's period end, status still active
+	updated, err := s.GetStores().SubscriptionRepo.Get(ctx, inheritedSub.ID)
+	s.Require().NoError(err)
+	s.Equal(types.SubscriptionStatusActive, updated.SubscriptionStatus)
+	s.True(updated.CancelAtPeriodEnd)
+	s.Require().NotNil(updated.CancelAt)
+	s.Equal(parentSub.CurrentPeriodEnd.UTC(), updated.CancelAt.UTC())
+
+	// Parent stays type=parent
+	refreshedParent, err := s.GetStores().SubscriptionRepo.Get(ctx, parentSub.ID)
+	s.Require().NoError(err)
+	s.Equal(types.SubscriptionTypeParent, refreshedParent.SubscriptionType)
+}
+
+// TestExecuteRemoveInheritance_NotParent verifies that calling remove on a non-parent
+// subscription returns an error.
+func (s *SubscriptionModificationServiceSuite) TestExecuteRemoveInheritance_NotParent() {
+	ctx := s.GetContext()
+	parent := s.createCustomer("ext-rp-002")
+	standaloneSubOwner := s.createActiveSub(parent.ID)
+
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeInheritance,
+		InheritanceParams: &dto.SubModifyInheritanceRequest{
+			Action:                      dto.InheritanceActionRemove,
+			ExternalCustomerIDsToRemove: []string{"some-ext-id"},
+		},
+	}
+
+	_, err := s.service.Execute(ctx, standaloneSubOwner.ID, req)
+	s.Require().Error(err)
+	s.Contains(err.Error(), "not a parent subscription")
+}
+
+// TestExecuteRemoveInheritance_ChildNotFound verifies that removing a child
+// that has no inherited sub under this parent returns an error.
+func (s *SubscriptionModificationServiceSuite) TestExecuteRemoveInheritance_ChildNotFound() {
+	ctx := s.GetContext()
+	_, _, parentSub, _ := s.createParentSubWithChild("ext-rp-003", "ext-rc-003")
+	unrelated := s.createCustomer("ext-unrelated-003")
+
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeInheritance,
+		InheritanceParams: &dto.SubModifyInheritanceRequest{
+			Action:                      dto.InheritanceActionRemove,
+			ExternalCustomerIDsToRemove: []string{unrelated.ExternalID},
+		},
+	}
+
+	_, err := s.service.Execute(ctx, parentSub.ID, req)
+	s.Require().Error(err)
+	s.Contains(err.Error(), "inherited subscription not found")
+}
+
+// TestExecuteRemoveInheritance_AlreadyScheduled verifies that calling remove twice
+// on the same child returns an error on the second call.
+func (s *SubscriptionModificationServiceSuite) TestExecuteRemoveInheritance_AlreadyScheduled() {
+	ctx := s.GetContext()
+	_, child, parentSub, _ := s.createParentSubWithChild("ext-rp-004", "ext-rc-004")
+
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeInheritance,
+		InheritanceParams: &dto.SubModifyInheritanceRequest{
+			Action:                      dto.InheritanceActionRemove,
+			ExternalCustomerIDsToRemove: []string{child.ExternalID},
+		},
+	}
+
+	// First call should succeed
+	_, err := s.service.Execute(ctx, parentSub.ID, req)
+	s.Require().NoError(err)
+
+	// Second call should fail
+	_, err = s.service.Execute(ctx, parentSub.ID, req)
+	s.Require().Error(err)
+	s.Contains(err.Error(), "already scheduled for removal")
+}
+
+// TestPreviewRemoveInheritance_Success verifies that preview returns the expected
+// changed subscriptions without writing to the database.
+func (s *SubscriptionModificationServiceSuite) TestPreviewRemoveInheritance_Success() {
+	ctx := s.GetContext()
+	_, child, parentSub, inheritedSub := s.createParentSubWithChild("ext-rp-005", "ext-rc-005")
+
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeInheritance,
+		InheritanceParams: &dto.SubModifyInheritanceRequest{
+			Action:                      dto.InheritanceActionRemove,
+			ExternalCustomerIDsToRemove: []string{child.ExternalID},
+		},
+	}
+
+	resp, err := s.service.Preview(ctx, parentSub.ID, req)
+	s.Require().NoError(err)
+	s.Require().NotNil(resp)
+
+	// Should show one changed subscription with effective date = parent period end
+	s.Require().Len(resp.ChangedResources.Subscriptions, 1)
+	cs := resp.ChangedResources.Subscriptions[0]
+	s.Equal(inheritedSub.ID, cs.ID)
+	s.Equal(dto.ChangedSubscriptionActionUpdated, cs.Action)
+	s.Require().NotNil(cs.CurrentPeriodEnd)
+	s.Equal(parentSub.CurrentPeriodEnd.UTC(), cs.CurrentPeriodEnd.UTC())
+
+	// Preview must NOT have written to the DB
+	notChanged, err := s.GetStores().SubscriptionRepo.Get(ctx, inheritedSub.ID)
+	s.Require().NoError(err)
+	s.Nil(notChanged.CancelAt, "preview must not persist cancel_at")
+	s.False(notChanged.CancelAtPeriodEnd, "preview must not persist cancel_at_period_end")
 }
 
 // ─────────────────────────────────────────────
@@ -1263,4 +1564,259 @@ func (s *SubscriptionModificationServiceSuite) TestExecute_UnknownTypeRejected()
 		Type: dto.SubscriptionModifyType("unknown"),
 	})
 	s.Require().Error(err)
+}
+
+// ─────────────────────────────────────────────
+// Sub-feature: Trial End Modification
+// ─────────────────────────────────────────────
+
+func (s *SubscriptionModificationServiceSuite) createTrialingSub(customerID string) *subscription.Subscription {
+	ctx := s.GetContext()
+	now := s.GetNow()
+	p := s.createPlan()
+	trialStart := now
+	trialEnd := now.AddDate(0, 0, 14)
+	sub := &subscription.Subscription{
+		ID:                 types.GenerateUUIDWithPrefix(types.UUID_PREFIX_SUBSCRIPTION),
+		BaseModel:          types.GetDefaultBaseModel(ctx),
+		CustomerID:         customerID,
+		PlanID:             p.ID,
+		Currency:           "USD",
+		BillingPeriod:      types.BILLING_PERIOD_MONTHLY,
+		BillingPeriodCount: 1,
+		BillingCycle:       types.BillingCycleAnniversary,
+		BillingAnchor:      now,
+		SubscriptionStatus: types.SubscriptionStatusTrialing,
+		SubscriptionType:   types.SubscriptionTypeStandalone,
+		CurrentPeriodStart: trialStart,
+		CurrentPeriodEnd:   trialEnd,
+		StartDate:          now,
+		TrialStart:         &trialStart,
+		TrialEnd:           &trialEnd,
+	}
+	s.Require().NoError(s.GetStores().SubscriptionRepo.Create(ctx, sub))
+	return sub
+}
+
+func (s *SubscriptionModificationServiceSuite) TestTrialEnd_RejectsNonTrialingSub() {
+	ctx := s.GetContext()
+	cust := s.createCustomer("ext-trial-001")
+	sub := s.createActiveSub(cust.ID)
+
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeTrialEnd,
+		TrialEndParams: &dto.SubModifyTrialEndRequest{
+			Action: dto.TrialEndActionImmediate,
+		},
+	}
+	_, err := s.service.Execute(ctx, sub.ID, req)
+	s.Require().Error(err)
+	s.Contains(err.Error(), "not in trialing status")
+}
+
+func (s *SubscriptionModificationServiceSuite) TestTrialEnd_PreviewRejectsNonTrialing() {
+	ctx := s.GetContext()
+	cust := s.createCustomer("ext-trial-002")
+	sub := s.createActiveSub(cust.ID)
+
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeTrialEnd,
+		TrialEndParams: &dto.SubModifyTrialEndRequest{
+			Action: dto.TrialEndActionImmediate,
+		},
+	}
+	_, err := s.service.Preview(ctx, sub.ID, req)
+	s.Require().Error(err)
+	s.Contains(err.Error(), "not in trialing status")
+}
+
+func (s *SubscriptionModificationServiceSuite) TestTrialEnd_ValidationMissingParams() {
+	ctx := s.GetContext()
+	cust := s.createCustomer("ext-trial-003")
+	sub := s.createTrialingSub(cust.ID)
+
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeTrialEnd,
+	}
+	_, err := s.service.Execute(ctx, sub.ID, req)
+	s.Require().Error(err)
+	s.Contains(err.Error(), "trial_end_params is required")
+}
+
+func (s *SubscriptionModificationServiceSuite) TestTrialEnd_ScheduledDateRequiresDate() {
+	ctx := s.GetContext()
+	cust := s.createCustomer("ext-trial-004")
+	sub := s.createTrialingSub(cust.ID)
+
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeTrialEnd,
+		TrialEndParams: &dto.SubModifyTrialEndRequest{
+			Action: dto.TrialEndActionScheduledDate,
+		},
+	}
+	_, err := s.service.Execute(ctx, sub.ID, req)
+	s.Require().Error(err)
+	s.Contains(err.Error(), "new_trial_end is required")
+}
+
+func (s *SubscriptionModificationServiceSuite) TestTrialEnd_ScheduledDateRejectsPast() {
+	ctx := s.GetContext()
+	cust := s.createCustomer("ext-trial-005")
+	sub := s.createTrialingSub(cust.ID)
+
+	pastDate := time.Now().UTC().Add(-24 * time.Hour)
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeTrialEnd,
+		TrialEndParams: &dto.SubModifyTrialEndRequest{
+			Action:      dto.TrialEndActionScheduledDate,
+			NewTrialEnd: &pastDate,
+		},
+	}
+	_, err := s.service.Execute(ctx, sub.ID, req)
+	s.Require().Error(err)
+	s.Contains(err.Error(), "new_trial_end must be in the future")
+}
+
+func (s *SubscriptionModificationServiceSuite) TestTrialEnd_ScheduledDateExtend() {
+	ctx := s.GetContext()
+	cust := s.createCustomer("ext-trial-006")
+	sub := s.createTrialingSub(cust.ID)
+	originalTrialEnd := *sub.TrialEnd
+
+	newEnd := originalTrialEnd.AddDate(0, 0, 7)
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeTrialEnd,
+		TrialEndParams: &dto.SubModifyTrialEndRequest{
+			Action:      dto.TrialEndActionScheduledDate,
+			NewTrialEnd: &newEnd,
+		},
+	}
+	resp, err := s.service.Execute(ctx, sub.ID, req)
+	s.Require().NoError(err)
+	s.Require().NotNil(resp)
+
+	// Verify subscription was updated
+	updated, err := s.GetStores().SubscriptionRepo.Get(ctx, sub.ID)
+	s.Require().NoError(err)
+	s.Equal(types.SubscriptionStatusTrialing, updated.SubscriptionStatus)
+	s.True(updated.TrialEnd.Equal(newEnd))
+	s.True(updated.CurrentPeriodEnd.Equal(newEnd))
+
+	// Verify changed resources
+	s.Require().Len(resp.ChangedResources.Subscriptions, 1)
+	s.Equal(sub.ID, resp.ChangedResources.Subscriptions[0].ID)
+	s.Equal(dto.ChangedSubscriptionActionUpdated, resp.ChangedResources.Subscriptions[0].Action)
+}
+
+func (s *SubscriptionModificationServiceSuite) TestTrialEnd_ScheduledDateReduce() {
+	ctx := s.GetContext()
+	cust := s.createCustomer("ext-trial-007")
+	sub := s.createTrialingSub(cust.ID)
+
+	// Reduce by 7 days but still in the future
+	newEnd := time.Now().UTC().Add(24 * time.Hour)
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeTrialEnd,
+		TrialEndParams: &dto.SubModifyTrialEndRequest{
+			Action:      dto.TrialEndActionScheduledDate,
+			NewTrialEnd: &newEnd,
+		},
+	}
+	resp, err := s.service.Execute(ctx, sub.ID, req)
+	s.Require().NoError(err)
+	s.Require().NotNil(resp)
+
+	updated, err := s.GetStores().SubscriptionRepo.Get(ctx, sub.ID)
+	s.Require().NoError(err)
+	s.Equal(types.SubscriptionStatusTrialing, updated.SubscriptionStatus)
+	s.True(updated.TrialEnd.Equal(newEnd))
+	s.True(updated.CurrentPeriodEnd.Equal(newEnd))
+}
+
+func (s *SubscriptionModificationServiceSuite) TestTrialEnd_PreviewScheduledDate() {
+	ctx := s.GetContext()
+	cust := s.createCustomer("ext-trial-008")
+	sub := s.createTrialingSub(cust.ID)
+	originalTrialEnd := *sub.TrialEnd
+
+	newEnd := originalTrialEnd.AddDate(0, 0, 7)
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeTrialEnd,
+		TrialEndParams: &dto.SubModifyTrialEndRequest{
+			Action:      dto.TrialEndActionScheduledDate,
+			NewTrialEnd: &newEnd,
+		},
+	}
+	resp, err := s.service.Preview(ctx, sub.ID, req)
+	s.Require().NoError(err)
+	s.Require().NotNil(resp)
+
+	// Preview should NOT mutate the subscription
+	unchanged, err := s.GetStores().SubscriptionRepo.Get(ctx, sub.ID)
+	s.Require().NoError(err)
+	s.True(unchanged.TrialEnd.Equal(originalTrialEnd))
+
+	s.Require().Len(resp.ChangedResources.Subscriptions, 1)
+	s.Equal(dto.ChangedSubscriptionActionUpdated, resp.ChangedResources.Subscriptions[0].Action)
+}
+
+func (s *SubscriptionModificationServiceSuite) TestTrialEnd_PreviewImmediate() {
+	ctx := s.GetContext()
+	cust := s.createCustomer("ext-trial-009")
+	sub := s.createTrialingSub(cust.ID)
+	originalTrialEnd := *sub.TrialEnd
+
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeTrialEnd,
+		TrialEndParams: &dto.SubModifyTrialEndRequest{
+			Action: dto.TrialEndActionImmediate,
+		},
+	}
+	resp, err := s.service.Preview(ctx, sub.ID, req)
+	s.Require().NoError(err)
+	s.Require().NotNil(resp)
+
+	// Preview should NOT mutate the subscription
+	unchanged, err := s.GetStores().SubscriptionRepo.Get(ctx, sub.ID)
+	s.Require().NoError(err)
+	s.True(unchanged.TrialEnd.Equal(originalTrialEnd))
+	s.Equal(types.SubscriptionStatusTrialing, unchanged.SubscriptionStatus)
+}
+
+func (s *SubscriptionModificationServiceSuite) TestTrialEnd_RejectsInheritedSub() {
+	ctx := s.GetContext()
+	cust := s.createCustomer("ext-trial-010")
+	now := s.GetNow()
+	p := s.createPlan()
+	trialStart := now
+	trialEnd := now.AddDate(0, 0, 14)
+	sub := &subscription.Subscription{
+		ID:                 types.GenerateUUIDWithPrefix(types.UUID_PREFIX_SUBSCRIPTION),
+		BaseModel:          types.GetDefaultBaseModel(ctx),
+		CustomerID:         cust.ID,
+		PlanID:             p.ID,
+		Currency:           "USD",
+		BillingPeriod:      types.BILLING_PERIOD_MONTHLY,
+		BillingPeriodCount: 1,
+		BillingCycle:       types.BillingCycleAnniversary,
+		BillingAnchor:      now,
+		SubscriptionStatus: types.SubscriptionStatusTrialing,
+		SubscriptionType:   types.SubscriptionTypeInherited,
+		CurrentPeriodStart: trialStart,
+		CurrentPeriodEnd:   trialEnd,
+		StartDate:          now,
+		TrialStart:         &trialStart,
+		TrialEnd:           &trialEnd,
+	}
+	s.Require().NoError(s.GetStores().SubscriptionRepo.Create(ctx, sub))
+
+	req := dto.ExecuteSubscriptionModifyRequest{
+		Type: dto.SubscriptionModifyTypeTrialEnd,
+		TrialEndParams: &dto.SubModifyTrialEndRequest{
+			Action: dto.TrialEndActionImmediate,
+		},
+	}
+	_, err := s.service.Execute(ctx, sub.ID, req)
+	s.Require().Error(err)
+	s.Contains(err.Error(), "inherited subscription")
 }

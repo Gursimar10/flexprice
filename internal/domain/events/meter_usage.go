@@ -33,15 +33,19 @@ type MeterUsageQueryParams struct {
 	ExternalCustomerIDs []string
 	MeterID             string
 	MeterIDs            []string
-	StartTime          time.Time
-	EndTime            time.Time
-	AggregationType    types.AggregationType
-	WindowSize         types.WindowSize
-	BillingAnchor      *time.Time
+	StartTime           time.Time
+	EndTime             time.Time
+	AggregationType     types.AggregationType
+	WindowSize          types.WindowSize
+	BillingAnchor       *time.Time
 	// GroupByProperty is the JSON property key for group-by aggregation (e.g. for bucketed MAX meters)
 	GroupByProperty string
 	// UseFinal enables FINAL for ReplacingMergeTree deduplication (use for billing queries)
 	UseFinal bool
+	// PropertyFilters restrict events whose properties match. e.g. {"model": ["gpt-4"]}
+	PropertyFilters map[string][]string
+	// Sources restricts events to those whose source is in the list.
+	Sources []string
 }
 
 // MeterUsageResult represents a single time-bucketed aggregation point
@@ -58,6 +62,61 @@ type MeterUsageAggregationResult struct {
 	TotalValue      decimal.Decimal       `json:"total_value"`
 	EventCount      uint64                `json:"event_count"`
 	Points          []MeterUsageResult    `json:"points,omitempty"`
+}
+
+// MeterUsageDetailedAnalyticsParams defines parameters for detailed meter usage analytics
+// with support for group by, property filters, source filtering, and time-series breakdown.
+type MeterUsageDetailedAnalyticsParams struct {
+	TenantID            string
+	EnvironmentID       string
+	ExternalCustomerID  string
+	ExternalCustomerIDs []string
+	MeterIDs            []string
+	// FeatureIDs are resolved to MeterIDs by the service before querying.
+	// Takes effect only when MeterIDs is empty.
+	FeatureIDs       []string
+	StartTime        time.Time
+	EndTime          time.Time
+	GroupBy          []string            // "source", "meter_id", "properties.<field>"
+	PropertyFilters  map[string][]string // e.g. {"model": ["gpt-4", "gpt-3.5"]}
+	Sources          []string
+	AggregationTypes []types.AggregationType // SUM, MAX, LATEST, COUNT_UNIQUE, COUNT
+	WindowSize       types.WindowSize
+	BillingAnchor    *time.Time
+	UseFinal         bool
+	// Expand mirrors dto.GetUsageAnalyticsRequest.Expand. Allowed values:
+	// "price", "meter", "feature", "subscription_line_item", "plan", "addon", "source".
+	Expand []string
+	// IncludeChildren mirrors dto.GetUsageAnalyticsRequest.IncludeChildren.
+	IncludeChildren bool
+	// BreakdownBucket mirrors dto.GetUsageAnalyticsRequest.BreakdownBucket: when
+	// true, each point is stamped with its BucketID/PriceID and per-bucket
+	// summaries are appended. Requires WindowSize to be set.
+	BreakdownBucket bool
+}
+
+// MeterUsageDetailedResult holds aggregated analytics for a single group combination
+type MeterUsageDetailedResult struct {
+	MeterID          string
+	Source           string
+	Sources          []string          // populated when source is NOT in group_by
+	Properties       map[string]string // property group-by values
+	TotalUsage       decimal.Decimal
+	MaxUsage         decimal.Decimal
+	LatestUsage      decimal.Decimal
+	CountUniqueUsage uint64
+	EventCount       uint64
+	Points           []MeterUsageDetailedPoint
+}
+
+// MeterUsageDetailedPoint is a single time-bucketed data point with all aggregation values
+type MeterUsageDetailedPoint struct {
+	WindowStart      time.Time
+	TotalUsage       decimal.Decimal
+	MaxUsage         decimal.Decimal
+	LatestUsage      decimal.Decimal
+	CountUniqueUsage uint64
+	EventCount       uint64
 }
 
 // MeterUsageRepository defines read/write operations on the meter_usage ClickHouse table
@@ -81,4 +140,13 @@ type MeterUsageRepository interface {
 	// GetDistinctMeterIDs returns the set of meter_ids that have data in the meter_usage table
 	// for the given customer(s) and time range. Used to skip meters with zero usage.
 	GetDistinctMeterIDs(ctx context.Context, params *MeterUsageQueryParams) ([]string, error)
+
+	// GetDetailedAnalytics provides comprehensive analytics with filtering, grouping, and time-series data
+	GetDetailedAnalytics(ctx context.Context, params *MeterUsageDetailedAnalyticsParams) ([]*MeterUsageDetailedResult, error)
+
+	// GetMeterUsageForExport retrieves meter usage data for export in batches
+	GetMeterUsageForExport(ctx context.Context, startTime, endTime time.Time, batchSize int, offset int) ([]*MeterUsage, error)
+
+	// GetByEventID returns the meter_usage record for a single event, or nil if not yet processed.
+	GetByEventID(ctx context.Context, tenantID, environmentID, eventID string) (*MeterUsage, error)
 }

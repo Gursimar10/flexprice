@@ -997,11 +997,11 @@ func init() {
 	// invoice.DefaultTotal holds the default value on creation for the total field.
 	invoice.DefaultTotal = invoiceDescTotal.Default.(decimal.Decimal)
 	// invoiceDescVersion is the schema descriptor for version field.
-	invoiceDescVersion := invoiceFields[29].Descriptor()
+	invoiceDescVersion := invoiceFields[30].Descriptor()
 	// invoice.DefaultVersion holds the default value on creation for the version field.
 	invoice.DefaultVersion = invoiceDescVersion.Default.(int)
 	// invoiceDescTotalPrepaidCreditsApplied is the schema descriptor for total_prepaid_credits_applied field.
-	invoiceDescTotalPrepaidCreditsApplied := invoiceFields[32].Descriptor()
+	invoiceDescTotalPrepaidCreditsApplied := invoiceFields[33].Descriptor()
 	// invoice.DefaultTotalPrepaidCreditsApplied holds the default value on creation for the total_prepaid_credits_applied field.
 	invoice.DefaultTotalPrepaidCreditsApplied = invoiceDescTotalPrepaidCreditsApplied.Default.(decimal.Decimal)
 	invoicelineitemMixin := schema.InvoiceLineItem{}.Mixin()
@@ -1673,6 +1673,10 @@ func init() {
 	subscriptionDescSubscriptionType := subscriptionFields[36].Descriptor()
 	// subscription.DefaultSubscriptionType holds the default value on creation for the subscription_type field.
 	subscription.DefaultSubscriptionType = types.SubscriptionType(subscriptionDescSubscriptionType.Default.(string))
+	// subscriptionDescSyncedPriceSequence is the schema descriptor for synced_price_sequence field.
+	subscriptionDescSyncedPriceSequence := subscriptionFields[38].Descriptor()
+	// subscription.DefaultSyncedPriceSequence holds the default value on creation for the synced_price_sequence field.
+	subscription.DefaultSyncedPriceSequence = subscriptionDescSyncedPriceSequence.Default.(int64)
 	subscriptionlineitemMixin := schema.SubscriptionLineItem{}.Mixin()
 	subscriptionlineitemMixinFields0 := subscriptionlineitemMixin[0].Fields()
 	_ = subscriptionlineitemMixinFields0
@@ -2148,18 +2152,22 @@ func init() {
 	tenantDescStatus := tenantFields[2].Descriptor()
 	// tenant.DefaultStatus holds the default value on creation for the status field.
 	tenant.DefaultStatus = tenantDescStatus.Default.(string)
+	// tenantDescInternalStatus is the schema descriptor for internal_status field.
+	tenantDescInternalStatus := tenantFields[3].Descriptor()
+	// tenant.DefaultInternalStatus holds the default value on creation for the internal_status field.
+	tenant.DefaultInternalStatus = tenantDescInternalStatus.Default.(string)
 	// tenantDescCreatedAt is the schema descriptor for created_at field.
-	tenantDescCreatedAt := tenantFields[3].Descriptor()
+	tenantDescCreatedAt := tenantFields[4].Descriptor()
 	// tenant.DefaultCreatedAt holds the default value on creation for the created_at field.
 	tenant.DefaultCreatedAt = tenantDescCreatedAt.Default.(func() time.Time)
 	// tenantDescUpdatedAt is the schema descriptor for updated_at field.
-	tenantDescUpdatedAt := tenantFields[4].Descriptor()
+	tenantDescUpdatedAt := tenantFields[5].Descriptor()
 	// tenant.DefaultUpdatedAt holds the default value on creation for the updated_at field.
 	tenant.DefaultUpdatedAt = tenantDescUpdatedAt.Default.(func() time.Time)
 	// tenant.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
 	tenant.UpdateDefaultUpdatedAt = tenantDescUpdatedAt.UpdateDefault.(func() time.Time)
 	// tenantDescBillingDetails is the schema descriptor for billing_details field.
-	tenantDescBillingDetails := tenantFields[5].Descriptor()
+	tenantDescBillingDetails := tenantFields[6].Descriptor()
 	// tenant.DefaultBillingDetails holds the default value on creation for the billing_details field.
 	tenant.DefaultBillingDetails = tenantDescBillingDetails.Default.(schema.TenantBillingDetails)
 	userMixin := schema.User{}.Mixin()
@@ -2186,11 +2194,11 @@ func init() {
 	// user.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
 	user.UpdateDefaultUpdatedAt = userDescUpdatedAt.UpdateDefault.(func() time.Time)
 	// userDescType is the schema descriptor for type field.
-	userDescType := userFields[2].Descriptor()
+	userDescType := userFields[3].Descriptor()
 	// user.DefaultType holds the default value on creation for the type field.
 	user.DefaultType = userDescType.Default.(string)
 	// userDescRoles is the schema descriptor for roles field.
-	userDescRoles := userFields[3].Descriptor()
+	userDescRoles := userFields[4].Descriptor()
 	// user.DefaultRoles holds the default value on creation for the roles field.
 	user.DefaultRoles = userDescRoles.Default.([]string)
 	walletMixin := schema.Wallet{}.Mixin()

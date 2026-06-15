@@ -102,6 +102,10 @@ const (
 	FieldPaymentTerms = "payment_terms"
 	// FieldSubscriptionType holds the string denoting the subscription_type field in the database.
 	FieldSubscriptionType = "subscription_type"
+	// FieldAutoInvoiceThreshold holds the string denoting the auto_invoice_threshold field in the database.
+	FieldAutoInvoiceThreshold = "auto_invoice_threshold"
+	// FieldSyncedPriceSequence holds the string denoting the synced_price_sequence field in the database.
+	FieldSyncedPriceSequence = "synced_price_sequence"
 	// EdgeLineItems holds the string denoting the line_items edge name in mutations.
 	EdgeLineItems = "line_items"
 	// EdgePauses holds the string denoting the pauses edge name in mutations.
@@ -224,6 +228,8 @@ var Columns = []string{
 	FieldParentSubscriptionID,
 	FieldPaymentTerms,
 	FieldSubscriptionType,
+	FieldAutoInvoiceThreshold,
+	FieldSyncedPriceSequence,
 }
 
 // ValidColumn reports if the column name is valid (part of the table columns).
@@ -297,6 +303,8 @@ var (
 	DefaultEnableTrueUp bool
 	// DefaultSubscriptionType holds the default value on creation for the "subscription_type" field.
 	DefaultSubscriptionType types.SubscriptionType
+	// DefaultSyncedPriceSequence holds the default value on creation for the "synced_price_sequence" field.
+	DefaultSyncedPriceSequence int64
 )
 
 // OrderOption defines the ordering options for the Subscription queries.
@@ -515,6 +523,16 @@ func ByPaymentTerms(opts ...sql.OrderTermOption) OrderOption {
 // BySubscriptionType orders the results by the subscription_type field.
 func BySubscriptionType(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldSubscriptionType, opts...).ToFunc()
+}
+
+// ByAutoInvoiceThreshold orders the results by the auto_invoice_threshold field.
+func ByAutoInvoiceThreshold(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldAutoInvoiceThreshold, opts...).ToFunc()
+}
+
+// BySyncedPriceSequence orders the results by the synced_price_sequence field.
+func BySyncedPriceSequence(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldSyncedPriceSequence, opts...).ToFunc()
 }
 
 // ByLineItemsCount orders the results by line_items count.

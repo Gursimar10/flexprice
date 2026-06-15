@@ -19,6 +19,15 @@ const (
 	InvoiceLineItemEntityTypeSubscription InvoiceLineItemEntityType = "subscription"
 )
 
+// InvoiceLineItemMetadataKey represents well-known metadata keys on invoice line items.
+type InvoiceLineItemMetadataKey = string
+
+const (
+	// InvoiceLineItemMetadataKeyChildCustomerID is the customer name of the child subscription
+	// in a grouped-invoicing scenario.
+	InvoiceLineItemMetadataKeyChildCustomerID InvoiceLineItemMetadataKey = "child_customer_id"
+)
+
 // InvoiceCadence defines when an invoice is generated relative to the billing period
 // ARREAR: Invoice generated at the end of the billing period (after service delivery)
 // ADVANCE: Invoice generated at the beginning of the billing period (before service delivery)
@@ -228,6 +237,18 @@ const (
 	// Flow: manual invoice creation API
 	// Zero-dollar: marked SKIPPED.
 	InvoiceBillingReasonManual InvoiceBillingReason = "MANUAL"
+
+	// InvoiceBillingReasonAutoInvoiceThreshold is generated mid-period when cumulative usage for the
+	// current billing period crosses the subscription's auto_invoice_threshold.
+	// Flow: AutoInvoiceThresholdBillingWorkflow (5-min schedule) → ProcessAutoInvoiceThresholdBilling service method
+	// Compute: arrear usage charges for current_period_start → now (ReferencePointPeriodEnd)
+	// Zero-dollar: marked SKIPPED; current_period_start still advances to avoid re-checking.
+	// Side-effect: advances current_period_start to the invoice's period_end after finalization.
+	InvoiceBillingReasonAutoInvoiceThreshold InvoiceBillingReason = "AUTO_INVOICE_THRESHOLD"
+
+	// InvoiceBillingReasonWalletAutoTopup is generated when a wallet balance drops
+	// below the auto-topup threshold and invoiced top-up is enabled.
+	InvoiceBillingReasonWalletAutoTopup InvoiceBillingReason = "WALLET_AUTO_TOPUP"
 )
 
 func (r InvoiceBillingReason) String() string {
@@ -243,6 +264,8 @@ func (r InvoiceBillingReason) Validate() error {
 		InvoiceBillingReasonSubscriptionTrialStart,
 		InvoiceBillingReasonProration,
 		InvoiceBillingReasonManual,
+		InvoiceBillingReasonAutoInvoiceThreshold,
+		InvoiceBillingReasonWalletAutoTopup,
 	}
 
 	if r != "" && !lo.Contains(allowed, r) {
@@ -411,6 +434,10 @@ type InvoiceFilter struct {
 	// Use this to separate recurring charges from one-time fees or credit adjustments
 	InvoiceType InvoiceType `json:"invoice_type,omitempty" form:"invoice_type"`
 
+	// currency filters invoices by their currency (ISO 4217 code, e.g. "usd", "eur").
+	// Matches on the invoices.currency column exactly.
+	Currency string `json:"currency,omitempty" form:"currency"`
+
 	// invoice_status filters by the current state of invoices in their lifecycle
 	// Multiple statuses can be specified to include invoices in any of the listed states
 	InvoiceStatus []InvoiceStatus `json:"invoice_status,omitempty" form:"invoice_status"`
@@ -418,6 +445,9 @@ type InvoiceFilter struct {
 	// payment_status filters by the payment state of invoices
 	// Multiple statuses can be specified to include invoices with any of the listed payment states
 	PaymentStatus []PaymentStatus `json:"payment_status,omitempty" form:"payment_status"`
+
+	// BillingReason filters invoices by why they were generated
+	BillingReason InvoiceBillingReason `json:"billing_reason,omitempty" form:"billing_reason"`
 
 	// amount_due_gt filters invoices with a total amount due greater than the specified value
 	// Useful for finding invoices above a certain threshold or identifying high-value invoices
@@ -465,6 +495,13 @@ func (f *InvoiceFilter) Validate() error {
 			return ierr.WithError(err).WithHint("invalid time range").Mark(ierr.ErrValidation)
 		}
 	}
+
+	if f.BillingReason != "" {
+		if err := f.BillingReason.Validate(); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 

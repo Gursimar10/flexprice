@@ -90,6 +90,30 @@ func (r *UpdateWalletRequest) Validate() error {
 	return validator.ValidateRequest(r)
 }
 
+type WalletModificationType string
+
+const (
+	WalletModificationTypePrepaidToPostpaid WalletModificationType = "prepaid_to_postpaid"
+)
+
+// ModifyWalletRequest represents the request to modify a wallet
+type ModifyWalletRequest struct {
+	ModificationType WalletModificationType `json:"modification_type" binding:"required"`
+}
+
+func (r *ModifyWalletRequest) Validate() error {
+	if r.ModificationType != WalletModificationTypePrepaidToPostpaid {
+		return ierr.NewError("modification_type must be 'prepaid_to_postpaid'").
+			Mark(ierr.ErrValidation)
+	}
+	return nil
+}
+
+type WalletModificationResponse struct {
+	OriginalWallet *WalletResponse `json:"original_wallet"`
+	NewWallet      *WalletResponse `json:"new_wallet"`
+}
+
 // ToWallet converts a create wallet request to a wallet
 func (r *CreateWalletRequest) ToWallet(ctx context.Context) *wallet.Wallet {
 	if r.ConversionRate.IsZero() {
@@ -296,6 +320,9 @@ type TopUpWalletRequest struct {
 	Description string `json:"description,omitempty"`
 	// metadata is a map of key-value pairs to store any additional information about the transaction
 	Metadata types.Metadata `json:"metadata,omitempty"`
+	// BillingReason indicates why this top-up was triggered (e.g. WALLET_AUTO_TOPUP).
+	// When set, it is stamped on the invoice created for PURCHASED_CREDIT_INVOICED transactions.
+	BillingReason types.InvoiceBillingReason `json:"-"`
 }
 
 func (r *TopUpWalletRequest) Validate() error {

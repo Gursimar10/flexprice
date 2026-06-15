@@ -10,9 +10,11 @@ import (
 	"github.com/flexprice/flexprice/internal/api/dto"
 	"github.com/flexprice/flexprice/internal/domain/customer"
 	"github.com/flexprice/flexprice/internal/domain/events"
+	"github.com/flexprice/flexprice/internal/domain/subscription"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/types"
+	"github.com/samber/lo"
 	"github.com/shopspring/decimal"
 )
 
@@ -25,6 +27,7 @@ type UsageAnalyticsGetter interface {
 type UsageAnalyticsExporter struct {
 	customerRepo         customer.Repository
 	eventRepo            events.Repository
+	lineItemRepo         subscription.LineItemRepository
 	usageAnalyticsGetter UsageAnalyticsGetter
 	logger               *logger.Logger
 }
@@ -33,12 +36,14 @@ type UsageAnalyticsExporter struct {
 func NewUsageAnalyticsExporter(
 	customerRepo customer.Repository,
 	eventRepo events.Repository,
+	lineItemRepo subscription.LineItemRepository,
 	usageAnalyticsGetter UsageAnalyticsGetter,
 	logger *logger.Logger,
 ) *UsageAnalyticsExporter {
 	return &UsageAnalyticsExporter{
 		customerRepo:         customerRepo,
 		eventRepo:            eventRepo,
+		lineItemRepo:         lineItemRepo,
 		usageAnalyticsGetter: usageAnalyticsGetter,
 		logger:               logger,
 	}
@@ -61,6 +66,8 @@ const (
 	UsageAnalyticsCSVHeadersTotalCost          UsageAnalyticsCSVHeaders = "total_cost"
 	UsageAnalyticsCSVHeadersCurrency           UsageAnalyticsCSVHeaders = "currency"
 	UsageAnalyticsCSVHeadersSource             UsageAnalyticsCSVHeaders = "source"
+	UsageAnalyticsCSVHeadersFeatureGroupName   UsageAnalyticsCSVHeaders = "feature_group_name"
+	UsageAnalyticsCSVHeadersAggregationField   UsageAnalyticsCSVHeaders = "aggregation_field"
 )
 
 // usageAnalyticsStaticHeaders is the fixed set of base CSV columns.
@@ -72,8 +79,10 @@ var usageAnalyticsStaticHeaders = []string{
 	string(UsageAnalyticsCSVHeadersEndTime),
 	string(UsageAnalyticsCSVHeadersFeatureName),
 	string(UsageAnalyticsCSVHeadersFeatureID),
+	string(UsageAnalyticsCSVHeadersFeatureGroupName),
 	string(UsageAnalyticsCSVHeadersEventName),
 	string(UsageAnalyticsCSVHeadersEventCount),
+	string(UsageAnalyticsCSVHeadersAggregationField),
 	string(UsageAnalyticsCSVHeadersTotalUsage),
 	string(UsageAnalyticsCSVHeadersTotalCost),
 	string(UsageAnalyticsCSVHeadersCurrency),
@@ -95,6 +104,8 @@ type usageAnalyticsRecord struct {
 	TotalCost          decimal.Decimal
 	Currency           string
 	Source             string
+	FeatureGroupName   string
+	AggregationField   string
 	// CustomerMetadata holds the customer's raw metadata for dynamic column lookup.
 	CustomerMetadata types.Metadata
 }
@@ -103,7 +114,7 @@ type usageAnalyticsRecord struct {
 // Dynamic metadata columns (customer entity only) are appended after the static columns
 // when the caller includes export_metadata_fields in the job config.
 func (e *UsageAnalyticsExporter) PrepareData(ctx context.Context, request *dto.ExportRequest) ([]byte, int, error) {
-	e.logger.Infow("starting usage analytics data fetch",
+	e.logger.Info(ctx, "starting usage analytics data fetch",
 		"tenant_id", request.TenantID,
 		"env_id", request.EnvID,
 		"start_time", request.StartTime,
@@ -123,16 +134,13 @@ func (e *UsageAnalyticsExporter) PrepareData(ctx context.Context, request *dto.E
 			Mark(ierr.ErrInternal)
 	}
 
-	externalCustomerIDs, err := e.eventRepo.GetDistinctExternalCustomerIDs(ctx, request.StartTime, request.EndTime)
+	customers, err := e.resolveExportCustomers(ctx, request.StartTime, request.EndTime)
 	if err != nil {
-		return nil, 0, ierr.WithError(err).
-			WithHint("Failed to get distinct external customer ids").
-			Mark(ierr.ErrDatabase)
+		return nil, 0, err
 	}
 
-	// if no external customer ids found, return empty CSV with headers only
-	if len(externalCustomerIDs) == 0 {
-		e.logger.Infow("no external customer ids found, uploading empty CSV with headers only",
+	if len(customers) == 0 {
+		e.logger.Info(ctx, "no customers found for usage analytics export, uploading empty CSV with headers only",
 			"tenant_id", request.TenantID,
 			"env_id", request.EnvID,
 			"start_time", request.StartTime,
@@ -146,17 +154,7 @@ func (e *UsageAnalyticsExporter) PrepareData(ctx context.Context, request *dto.E
 		return buf.Bytes(), 0, nil
 	}
 
-	filter := types.NewCustomerFilter()
-	filter.ExternalIDs = externalCustomerIDs
-
-	customers, err := e.customerRepo.ListAll(ctx, filter)
-	if err != nil {
-		return nil, 0, ierr.WithError(err).
-			WithHint("Failed to list customers").
-			Mark(ierr.ErrDatabase)
-	}
-
-	e.logger.Infow("found customers to process",
+	e.logger.Info(ctx, "found customers to process",
 		"customer_count", len(customers),
 		"tenant_id", request.TenantID,
 		"env_id", request.EnvID)
@@ -172,7 +170,7 @@ func (e *UsageAnalyticsExporter) PrepareData(ctx context.Context, request *dto.E
 		})
 		if err != nil {
 			failedCount++
-			e.logger.Warnw("failed to fetch usage analytics for customer, skipping",
+			e.logger.Info(ctx, "failed to fetch usage analytics for customer, skipping",
 				"customer_id", c.ID,
 				"external_id", c.ExternalID,
 				"error", err)
@@ -194,7 +192,11 @@ func (e *UsageAnalyticsExporter) PrepareData(ctx context.Context, request *dto.E
 				TotalCost:          item.TotalCost,
 				Currency:           item.Currency,
 				Source:             item.Source,
+				AggregationField:   string(item.AggregationType),
 				CustomerMetadata:   c.Metadata,
+			}
+			if item.Group != nil {
+				record.FeatureGroupName = item.Group.Name
 			}
 
 			if err := csvWriter.Write(e.buildRow(record, metadataFields)); err != nil {
@@ -216,24 +218,72 @@ func (e *UsageAnalyticsExporter) PrepareData(ctx context.Context, request *dto.E
 	csvBytes := buf.Bytes()
 
 	if recordCount == 0 {
-		e.logger.Infow("no usage analytics data found for export - uploading empty CSV with headers only",
+		e.logger.Info(ctx, "no usage analytics data found for export - uploading empty CSV with headers only",
 			"tenant_id", request.TenantID,
 			"env_id", request.EnvID,
 			"csv_size_bytes", len(csvBytes))
 	} else if failedCount > 0 {
-		e.logger.Warnw("usage analytics export completed with partial data",
+		e.logger.Info(ctx, "usage analytics export completed with partial data",
 			"total_customers", len(customers),
 			"failed_customers", failedCount,
 			"exported_records", recordCount,
 			"tenant_id", request.TenantID,
 			"env_id", request.EnvID)
 	} else {
-		e.logger.Infow("completed usage analytics export",
+		e.logger.Info(ctx, "completed usage analytics export",
 			"total_records", recordCount,
 			"csv_size_bytes", len(csvBytes))
 	}
 
 	return csvBytes, recordCount, nil
+}
+
+// resolveExportCustomers returns the union of customers that had events in the export window
+// and customers with published commitment true-up subscription line items.
+func (e *UsageAnalyticsExporter) resolveExportCustomers(ctx context.Context, startTime, endTime time.Time) ([]*customer.Customer, error) {
+	externalCustomerIDs, err := e.eventRepo.GetDistinctExternalCustomerIDs(ctx, startTime, endTime)
+	if err != nil {
+		return nil, err
+	}
+
+	trueUpCustomerIDs, err := e.lineItemRepo.GetDistinctCustomerIDsWithCommitmentTrueUp(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var customers []*customer.Customer
+
+	if len(externalCustomerIDs) > 0 {
+		eventFilter := types.NewCustomerFilter()
+		eventFilter.ExternalIDs = externalCustomerIDs
+		eventCustomers, err := e.customerRepo.ListAll(ctx, eventFilter)
+		if err != nil {
+			return nil, err
+		}
+		customers = append(customers, eventCustomers...)
+	}
+
+	remainingTrueUpCustomerIDs := trueUpCustomerIDs
+	if len(customers) > 0 {
+		fetchedCustomerIDs := lo.Map(customers, func(c *customer.Customer, _ int) string {
+			return c.ID
+		})
+		remainingTrueUpCustomerIDs = lo.Without(trueUpCustomerIDs, fetchedCustomerIDs...)
+	}
+
+	if len(remainingTrueUpCustomerIDs) > 0 {
+		trueUpFilter := types.NewCustomerFilter()
+		trueUpFilter.CustomerIDs = remainingTrueUpCustomerIDs
+		trueUpCustomers, err := e.customerRepo.ListAll(ctx, trueUpFilter)
+		if err != nil {
+			return nil, err
+		}
+		customers = append(customers, trueUpCustomers...)
+	}
+
+	return lo.UniqBy(customers, func(c *customer.Customer) string {
+		return c.ID
+	}), nil
 }
 
 // resolveHeaders returns the full CSV header row: static columns followed by one column per
@@ -264,8 +314,10 @@ func (e *UsageAnalyticsExporter) buildRow(record *usageAnalyticsRecord, metadata
 		record.EndTime.Format(time.RFC3339),
 		record.FeatureName,
 		record.FeatureID,
+		record.FeatureGroupName,
 		record.EventName,
 		strconv.FormatInt(record.EventCount, 10),
+		record.AggregationField,
 		record.TotalUsage.String(),
 		record.TotalCost.String(),
 		record.Currency,

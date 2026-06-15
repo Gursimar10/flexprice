@@ -9,7 +9,6 @@ import (
 	"github.com/flexprice/flexprice/internal/config"
 	"github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/logger"
-	"github.com/flexprice/flexprice/internal/sentry"
 	"github.com/flexprice/flexprice/internal/temporal/client"
 	temporalInterceptor "github.com/flexprice/flexprice/internal/temporal/interceptor"
 	"github.com/flexprice/flexprice/internal/temporal/models"
@@ -17,6 +16,7 @@ import (
 	invoiceModels "github.com/flexprice/flexprice/internal/temporal/models/invoice"
 	subscriptionModels "github.com/flexprice/flexprice/internal/temporal/models/subscription"
 	"github.com/flexprice/flexprice/internal/temporal/worker"
+	"github.com/flexprice/flexprice/internal/tracing"
 	"github.com/flexprice/flexprice/internal/types"
 	"go.temporal.io/sdk/interceptor"
 )
@@ -31,25 +31,25 @@ type temporalService struct {
 	client        client.TemporalClient
 	workerManager worker.TemporalWorkerManager
 	logger        *logger.Logger
-	sentry        *sentry.Service
+	tracing       *tracing.Service
 	workerConfig  config.TemporalWorkerConfig
 }
 
 // NewTemporalService creates a new temporal service instance
-func NewTemporalService(client client.TemporalClient, workerManager worker.TemporalWorkerManager, logger *logger.Logger, sentryService *sentry.Service, cfg *config.TemporalConfig) TemporalService {
+func NewTemporalService(client client.TemporalClient, workerManager worker.TemporalWorkerManager, logger *logger.Logger, tracingSvc *tracing.Service, cfg *config.TemporalConfig) TemporalService {
 	return &temporalService{
 		client:        client,
 		workerManager: workerManager,
 		logger:        logger,
-		sentry:        sentryService,
+		tracing:       tracingSvc,
 		workerConfig:  cfg.Worker,
 	}
 }
 
 // InitializeGlobalTemporalService initializes the global Temporal service instance
-func InitializeGlobalTemporalService(client client.TemporalClient, workerManager worker.TemporalWorkerManager, logger *logger.Logger, sentryService *sentry.Service, cfg *config.TemporalConfig) {
+func InitializeGlobalTemporalService(client client.TemporalClient, workerManager worker.TemporalWorkerManager, logger *logger.Logger, tracingSvc *tracing.Service, cfg *config.TemporalConfig) {
 	globalTemporalOnce.Do(func() {
-		globalTemporalService = NewTemporalService(client, workerManager, logger, sentryService, cfg)
+		globalTemporalService = NewTemporalService(client, workerManager, logger, tracingSvc, cfg)
 	})
 }
 
@@ -84,7 +84,7 @@ func (s *temporalService) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start temporal client: %w", err)
 	}
 
-	s.logger.Info("Temporal service started successfully")
+	s.logger.Info(ctx, "Temporal service started successfully")
 	return nil
 }
 
@@ -92,7 +92,7 @@ func (s *temporalService) Start(ctx context.Context) error {
 func (s *temporalService) Stop(ctx context.Context) error {
 	// Stop all workers first
 	if err := s.workerManager.StopAllWorkers(); err != nil {
-		s.logger.Error("Failed to stop all workers", "error", err)
+		s.logger.Error(ctx, "Failed to stop all workers", "error", err)
 	}
 
 	// Stop client
@@ -100,7 +100,7 @@ func (s *temporalService) Stop(ctx context.Context) error {
 		return fmt.Errorf("failed to stop temporal client: %w", err)
 	}
 
-	s.logger.Info("Temporal service stopped successfully")
+	s.logger.Info(ctx, "Temporal service stopped successfully")
 	return nil
 }
 
@@ -315,9 +315,9 @@ func (s *temporalService) buildWorkerOptions() *models.WorkerOptions {
 	}
 
 	// Add interceptors
-	if s.sentry != nil && s.sentry.IsEnabled() {
+	if s.tracing != nil && s.tracing.IsEnabled() {
 		options.Interceptors = []interceptor.WorkerInterceptor{
-			temporalInterceptor.NewSentryInterceptor(s.sentry),
+			temporalInterceptor.NewTracingInterceptor(s.tracing),
 			temporalInterceptor.NewWorkflowTrackingInterceptor(),
 		}
 	} else {
@@ -475,6 +475,18 @@ func (s *temporalService) extractWorkflowContextID(workflowType types.TemporalWo
 		if input, ok := params.(models.PaddleInvoiceSyncWorkflowInput); ok {
 			return input.InvoiceID
 		}
+	case types.TemporalPaddleInvoicePullSyncWorkflow:
+		if input, ok := params.(models.PaddleInvoicePullSyncWorkflowInput); ok {
+			return input.InvoiceID
+		}
+	case types.TemporalWhopInvoiceSyncWorkflow:
+		if input, ok := params.(models.WhopInvoiceSyncWorkflowInput); ok {
+			return input.InvoiceID
+		}
+	case types.TemporalWhopInvoiceMarkPaidWorkflow:
+		if input, ok := params.(models.WhopInvoiceMarkPaidWorkflowInput); ok {
+			return input.InvoiceID
+		}
 
 	// Vendor customer sync workflows — deterministic IDs prevent duplicate concurrent syncs.
 	case types.TemporalStripeCustomerSyncWorkflow:
@@ -500,6 +512,10 @@ func (s *temporalService) extractWorkflowContextID(workflowType types.TemporalWo
 	case types.TemporalPaddleCustomerSyncWorkflow:
 		if input, ok := params.(models.PaddleCustomerSyncWorkflowInput); ok {
 			return input.CustomerID
+		}
+	case types.TemporalPaddleSubscriptionSyncWorkflow:
+		if input, ok := params.(models.PaddleSubscriptionSyncWorkflowInput); ok {
+			return input.SubscriptionID
 		}
 	case types.TemporalRecalculateInvoiceWorkflow:
 		// Extract invoice ID from RecalculateInvoiceWorkflowInput
@@ -594,7 +610,7 @@ func (s *temporalService) buildWorkflowInput(ctx context.Context, workflowType t
 
 	// Handle different workflow types
 	switch workflowType {
-	case types.TemporalPriceSyncWorkflow:
+	case types.TemporalPriceSyncWorkflow, types.TemporalPriceSyncV2Workflow:
 		return s.buildPriceSyncInput(ctx, tenantID, environmentID, userID, params)
 	case types.TemporalQuickBooksPriceSyncWorkflow:
 		return s.buildQuickBooksPriceSyncInput(ctx, tenantID, environmentID, userID, params)
@@ -616,6 +632,8 @@ func (s *temporalService) buildWorkflowInput(ctx context.Context, workflowType t
 		return s.buildMoyasarInvoiceSyncInput(ctx, tenantID, environmentID, params)
 	case types.TemporalPaddleInvoiceSyncWorkflow:
 		return s.buildPaddleInvoiceSyncInput(ctx, tenantID, environmentID, params)
+	case types.TemporalPaddleInvoicePullSyncWorkflow:
+		return s.buildPaddleInvoicePullSyncInput(ctx, tenantID, environmentID, params)
 	case types.TemporalStripeInvoiceSyncWorkflow:
 		return s.buildStripeInvoiceSyncInput(ctx, tenantID, environmentID, params)
 	case types.TemporalRazorpayInvoiceSyncWorkflow:
@@ -624,6 +642,10 @@ func (s *temporalService) buildWorkflowInput(ctx context.Context, workflowType t
 		return s.buildChargebeeInvoiceSyncInput(ctx, tenantID, environmentID, params)
 	case types.TemporalQuickBooksInvoiceSyncWorkflow:
 		return s.buildQuickBooksInvoiceSyncInput(ctx, tenantID, environmentID, params)
+	case types.TemporalWhopInvoiceSyncWorkflow:
+		return s.buildWhopInvoiceSyncInput(ctx, tenantID, environmentID, params)
+	case types.TemporalWhopInvoiceMarkPaidWorkflow:
+		return s.buildWhopInvoiceMarkPaidInput(ctx, tenantID, environmentID, params)
 	case types.TemporalZohoBooksInvoiceSyncWorkflow:
 		return s.buildZohoBooksInvoiceSyncInput(ctx, tenantID, environmentID, params)
 	case types.TemporalStripeCustomerSyncWorkflow:
@@ -638,6 +660,8 @@ func (s *temporalService) buildWorkflowInput(ctx context.Context, workflowType t
 		return s.buildNomodCustomerSyncInput(ctx, tenantID, environmentID, params)
 	case types.TemporalPaddleCustomerSyncWorkflow:
 		return s.buildPaddleCustomerSyncInput(ctx, tenantID, environmentID, params)
+	case types.TemporalPaddleSubscriptionSyncWorkflow:
+		return s.buildPaddleSubscriptionSyncInput(ctx, tenantID, environmentID, params)
 	case types.TemporalCustomerOnboardingWorkflow:
 		return s.buildCustomerOnboardingInput(ctx, tenantID, environmentID, userID, params)
 	case types.TemporalPrepareProcessedEventsWorkflow:
@@ -858,6 +882,38 @@ func (s *temporalService) buildNomodInvoiceSyncInput(_ context.Context, tenantID
 		Mark(errors.ErrValidation)
 }
 
+func (s *temporalService) buildWhopInvoiceSyncInput(_ context.Context, tenantID, environmentID string, params interface{}) (interface{}, error) {
+	if input, ok := params.(*models.WhopInvoiceSyncWorkflowInput); ok {
+		input.TenantID = tenantID
+		input.EnvironmentID = environmentID
+		return *input, nil
+	}
+	if input, ok := params.(models.WhopInvoiceSyncWorkflowInput); ok {
+		input.TenantID = tenantID
+		input.EnvironmentID = environmentID
+		return input, nil
+	}
+	return nil, errors.NewError("invalid input for Whop invoice sync workflow").
+		WithHint("Provide WhopInvoiceSyncWorkflowInput with invoice_id and customer_id").
+		Mark(errors.ErrValidation)
+}
+
+func (s *temporalService) buildWhopInvoiceMarkPaidInput(_ context.Context, tenantID, environmentID string, params interface{}) (interface{}, error) {
+	if input, ok := params.(*models.WhopInvoiceMarkPaidWorkflowInput); ok {
+		input.TenantID = tenantID
+		input.EnvironmentID = environmentID
+		return *input, nil
+	}
+	if input, ok := params.(models.WhopInvoiceMarkPaidWorkflowInput); ok {
+		input.TenantID = tenantID
+		input.EnvironmentID = environmentID
+		return input, nil
+	}
+	return nil, errors.NewError("invalid input for Whop mark-paid workflow").
+		WithHint("Provide WhopInvoiceMarkPaidWorkflowInput with invoice_id").
+		Mark(errors.ErrValidation)
+}
+
 func (s *temporalService) buildMoyasarInvoiceSyncInput(_ context.Context, tenantID, environmentID string, params interface{}) (interface{}, error) {
 	// If already correct type, just ensure context is set
 	if input, ok := params.(*models.MoyasarInvoiceSyncWorkflowInput); ok {
@@ -895,6 +951,33 @@ func (s *temporalService) buildPaddleInvoiceSyncInput(_ context.Context, tenantI
 
 	return nil, errors.NewError("invalid input for Paddle invoice sync workflow").
 		WithHint("Provide PaddleInvoiceSyncWorkflowInput with invoice_id and customer_id").
+		Mark(errors.ErrValidation)
+}
+
+func (s *temporalService) buildPaddleInvoicePullSyncInput(_ context.Context, tenantID, environmentID string, params interface{}) (interface{}, error) {
+	if input, ok := params.(*models.PaddleInvoicePullSyncWorkflowInput); ok {
+		if input == nil {
+			return nil, errors.NewError("invalid input for Paddle invoice pull sync workflow").
+				WithHint("Provide a non-nil PaddleInvoicePullSyncWorkflowInput with invoice_id").
+				Mark(errors.ErrValidation)
+		}
+		input.TenantID = tenantID
+		input.EnvironmentID = environmentID
+		if err := input.Validate(); err != nil {
+			return nil, err
+		}
+		return *input, nil
+	}
+	if input, ok := params.(models.PaddleInvoicePullSyncWorkflowInput); ok {
+		input.TenantID = tenantID
+		input.EnvironmentID = environmentID
+		if err := input.Validate(); err != nil {
+			return nil, err
+		}
+		return input, nil
+	}
+	return nil, errors.NewError("invalid input for Paddle invoice pull sync workflow").
+		WithHint("Provide PaddleInvoicePullSyncWorkflowInput with invoice_id").
 		Mark(errors.ErrValidation)
 }
 
@@ -1082,6 +1165,18 @@ func (s *temporalService) buildPaddleCustomerSyncInput(_ context.Context, tenant
 	return nil, errors.NewError("invalid input for Paddle customer sync workflow").
 		WithHint("Provide PaddleCustomerSyncWorkflowInput with customer_id").
 		Mark(errors.ErrValidation)
+}
+
+func (s *temporalService) buildPaddleSubscriptionSyncInput(_ context.Context, tenantID, environmentID string, params interface{}) (interface{}, error) {
+	input, ok := params.(models.PaddleSubscriptionSyncWorkflowInput)
+	if !ok {
+		return nil, errors.NewError("invalid input for Paddle subscription sync workflow").
+			WithHint("Provide PaddleSubscriptionSyncWorkflowInput with subscription_id").
+			Mark(errors.ErrValidation)
+	}
+	input.TenantID = tenantID
+	input.EnvironmentID = environmentID
+	return input, nil
 }
 
 // buildProcessInvoiceInput builds input for process invoice workflow

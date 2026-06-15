@@ -16,10 +16,10 @@ type ZohoCustomerService interface {
 }
 
 type CustomerService struct {
-	client      ZohoClient
+	client       ZohoClient
 	customerRepo customerDomain.Repository
-	mappingRepo entityintegrationmapping.Repository
-	logger      *logger.Logger
+	mappingRepo  entityintegrationmapping.Repository
+	logger       *logger.Logger
 }
 
 func NewCustomerService(client ZohoClient, customerRepo customerDomain.Repository, mappingRepo entityintegrationmapping.Repository, logger *logger.Logger) ZohoCustomerService {
@@ -99,7 +99,7 @@ func (s *CustomerService) createCustomerMapping(ctx context.Context, customer *c
 	}
 	mapping.TenantID = customer.TenantID
 	if err := s.mappingRepo.Create(ctx, mapping); err != nil {
-		s.logger.Warnw("failed to create Zoho customer mapping",
+		s.logger.Error(ctx, "failed to create Zoho customer mapping",
 			"customer_id", customer.ID,
 			"zoho_contact_id", contact.ContactID,
 			"error", err)

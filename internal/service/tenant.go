@@ -16,6 +16,7 @@ import (
 type TenantService interface {
 	CreateTenant(ctx context.Context, req dto.CreateTenantRequest) (*dto.TenantResponse, error)
 	GetTenantByID(ctx context.Context, id string) (*dto.TenantResponse, error)
+	GetTenantInternalStatus(ctx context.Context, id string) (types.TenantInternalStatus, error)
 	AssignTenantToUser(ctx context.Context, req dto.AssignTenantRequest) error
 	GetAllTenants(ctx context.Context) ([]*dto.TenantResponse, error)
 	UpdateTenant(ctx context.Context, id string, req dto.UpdateTenantRequest) (*dto.TenantResponse, error)
@@ -49,7 +50,7 @@ func (s *tenantService) CreateTenant(ctx context.Context, req dto.CreateTenantRe
 	// Create a customer in the billing tenant for this new tenant
 	if err := s.CreateTenantAsBillingCustomer(ctx, newTenant); err != nil {
 		// Log error but don't fail tenant creation
-		s.Logger.ErrorwCtx(ctx, "Failed to create billing customer for tenant",
+		s.Logger.Error(ctx, "Failed to create billing customer for tenant",
 			"tenant_id", newTenant.ID,
 			"error", err)
 	}
@@ -60,7 +61,7 @@ func (s *tenantService) CreateTenant(ctx context.Context, req dto.CreateTenantRe
 // CreateTenantAsBillingCustomer creates a customer in the billing tenant using the tenant details
 func (s *tenantService) CreateTenantAsBillingCustomer(ctx context.Context, t *tenant.Tenant) error {
 	if s.Config.Billing.TenantID == "" {
-		s.Logger.WarnwCtx(ctx, "Billing tenant ID is not set, skipping customer creation",
+		s.Logger.Info(ctx, "Billing tenant ID is not set, skipping customer creation",
 			"tenant_id", t.ID)
 		return nil
 	}
@@ -132,7 +133,7 @@ func (s *tenantService) onboardTenantOnFreePlan(ctx context.Context, t *tenant.T
 	}
 
 	if freePlan == nil || freePrice == nil {
-		s.Logger.WarnwCtx(ctx, "No free plan found, skipping onboarding",
+		s.Logger.Info(ctx, "No free plan found, skipping onboarding",
 			"tenant_id", t.ID)
 		return nil
 	}
@@ -151,7 +152,7 @@ func (s *tenantService) onboardTenantOnFreePlan(ctx context.Context, t *tenant.T
 		BillingCycle:       types.BillingCycleAnniversary,
 	})
 	if err != nil {
-		s.Logger.ErrorwCtx(ctx, "Failed to create subscription",
+		s.Logger.Error(ctx, "Failed to create subscription",
 			"tenant_id", t.ID,
 			"error", err)
 		return err
@@ -167,6 +168,15 @@ func (s *tenantService) GetTenantByID(ctx context.Context, id string) (*dto.Tena
 	}
 
 	return dto.NewTenantResponse(t), nil
+}
+
+func (s *tenantService) GetTenantInternalStatus(ctx context.Context, id string) (types.TenantInternalStatus, error) {
+	t, err := s.TenantRepo.GetByID(ctx, id)
+	if err != nil {
+		return "", err
+	}
+
+	return t.InternalStatus, nil
 }
 
 func (s *tenantService) AssignTenantToUser(ctx context.Context, req dto.AssignTenantRequest) error {

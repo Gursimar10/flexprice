@@ -576,6 +576,34 @@ func (sc *SubscriptionCreate) SetNillableSubscriptionType(tt *types.Subscription
 	return sc
 }
 
+// SetAutoInvoiceThreshold sets the "auto_invoice_threshold" field.
+func (sc *SubscriptionCreate) SetAutoInvoiceThreshold(d decimal.Decimal) *SubscriptionCreate {
+	sc.mutation.SetAutoInvoiceThreshold(d)
+	return sc
+}
+
+// SetNillableAutoInvoiceThreshold sets the "auto_invoice_threshold" field if the given value is not nil.
+func (sc *SubscriptionCreate) SetNillableAutoInvoiceThreshold(d *decimal.Decimal) *SubscriptionCreate {
+	if d != nil {
+		sc.SetAutoInvoiceThreshold(*d)
+	}
+	return sc
+}
+
+// SetSyncedPriceSequence sets the "synced_price_sequence" field.
+func (sc *SubscriptionCreate) SetSyncedPriceSequence(i int64) *SubscriptionCreate {
+	sc.mutation.SetSyncedPriceSequence(i)
+	return sc
+}
+
+// SetNillableSyncedPriceSequence sets the "synced_price_sequence" field if the given value is not nil.
+func (sc *SubscriptionCreate) SetNillableSyncedPriceSequence(i *int64) *SubscriptionCreate {
+	if i != nil {
+		sc.SetSyncedPriceSequence(*i)
+	}
+	return sc
+}
+
 // SetID sets the "id" field.
 func (sc *SubscriptionCreate) SetID(s string) *SubscriptionCreate {
 	sc.mutation.SetID(s)
@@ -811,6 +839,10 @@ func (sc *SubscriptionCreate) defaults() {
 		v := subscription.DefaultSubscriptionType
 		sc.mutation.SetSubscriptionType(v)
 	}
+	if _, ok := sc.mutation.SyncedPriceSequence(); !ok {
+		v := subscription.DefaultSyncedPriceSequence
+		sc.mutation.SetSyncedPriceSequence(v)
+	}
 }
 
 // check runs all checks and user-defined validators on the builder.
@@ -964,6 +996,9 @@ func (sc *SubscriptionCreate) check() error {
 		if err := v.Validate(); err != nil {
 			return &ValidationError{Name: "subscription_type", err: fmt.Errorf(`ent: validator failed for field "Subscription.subscription_type": %w`, err)}
 		}
+	}
+	if _, ok := sc.mutation.SyncedPriceSequence(); !ok {
+		return &ValidationError{Name: "synced_price_sequence", err: errors.New(`ent: missing required field "Subscription.synced_price_sequence"`)}
 	}
 	return nil
 }
@@ -1167,6 +1202,14 @@ func (sc *SubscriptionCreate) createSpec() (*Subscription, *sqlgraph.CreateSpec)
 	if value, ok := sc.mutation.SubscriptionType(); ok {
 		_spec.SetField(subscription.FieldSubscriptionType, field.TypeString, value)
 		_node.SubscriptionType = value
+	}
+	if value, ok := sc.mutation.AutoInvoiceThreshold(); ok {
+		_spec.SetField(subscription.FieldAutoInvoiceThreshold, field.TypeOther, value)
+		_node.AutoInvoiceThreshold = &value
+	}
+	if value, ok := sc.mutation.SyncedPriceSequence(); ok {
+		_spec.SetField(subscription.FieldSyncedPriceSequence, field.TypeInt64, value)
+		_node.SyncedPriceSequence = value
 	}
 	if nodes := sc.mutation.LineItemsIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{

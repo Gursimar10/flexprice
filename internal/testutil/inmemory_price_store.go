@@ -48,14 +48,14 @@ func priceFilterFn(ctx context.Context, p *price.Price, filter interface{}) bool
 		return false
 	}
 
-	// Filter by plan IDs
+	// Filter by entity IDs
 	if len(f.EntityIDs) > 0 {
 		if !lo.Contains(f.EntityIDs, p.EntityID) {
 			return false
 		}
 	}
 
-	// filter by price ids
+	// Filter by price IDs
 	if len(f.PriceIDs) > 0 {
 		if !lo.Contains(f.PriceIDs, p.ID) {
 			return false
@@ -155,11 +155,17 @@ func (s *InMemoryPriceStore) Count(ctx context.Context, filter *types.PriceFilte
 	return count, nil
 }
 
-func (s *InMemoryPriceStore) Update(ctx context.Context, p *price.Price) error {
+func (s *InMemoryPriceStore) Update(ctx context.Context, p *price.Price, bumpSequence bool) error {
 	if p == nil {
 		return ierr.NewError("price cannot be nil").
 			WithHint("Price data is required").
 			Mark(ierr.ErrValidation)
+	}
+	// bumpSequence is a no-op for the in-memory store; the sequence column
+	// is only meaningful when run against Postgres where the plan-price sync
+	// observes it.
+	if bumpSequence {
+		p.Sequence++
 	}
 
 	err := s.InMemoryStore.Update(ctx, p.ID, p)
@@ -274,7 +280,7 @@ func (s *InMemoryPriceStore) ClearGroupIDsBulk(ctx context.Context, ids []string
 			return err
 		}
 		p.GroupID = ""
-		if err := s.Update(ctx, p); err != nil {
+		if err := s.Update(ctx, p, false); err != nil {
 			return ierr.WithError(err).
 				WithHint("Failed to clear group IDs in bulk").
 				Mark(ierr.ErrDatabase)
@@ -294,7 +300,7 @@ func (s *InMemoryPriceStore) ClearByGroupID(ctx context.Context, groupID string)
 	// Clear group ID for each price
 	for _, p := range prices {
 		p.GroupID = ""
-		if err := s.Update(ctx, p); err != nil {
+		if err := s.Update(ctx, p, false); err != nil {
 			return ierr.WithError(err).
 				WithHint("Failed to clear group ID by group ID").
 				Mark(ierr.ErrDatabase)

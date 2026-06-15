@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/flexprice/flexprice/internal/clickhouse"
 	"github.com/flexprice/flexprice/internal/domain/events"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/logger"
+	"github.com/flexprice/flexprice/internal/types"
 	"github.com/samber/lo"
 	"github.com/shopspring/decimal"
 )
@@ -266,7 +268,7 @@ func (r *MeterUsageRepository) marshalProperties(record *events.MeterUsage) stri
 	}
 	propsJSON, err := json.Marshal(record.Properties)
 	if err != nil {
-		r.logger.Errorw("failed to marshal properties for meter_usage",
+		r.logger.Error(context.Background(), "failed to marshal properties for meter_usage",
 			"event_id", record.ID,
 			"error", err,
 		)
@@ -285,7 +287,7 @@ func (r *MeterUsageRepository) GetUsageForBucketedMeters(ctx context.Context, pa
 
 	query, args := r.qb.BuildBucketedQuery(params)
 
-	r.logger.Debugw("executing bucketed meter usage query",
+	r.logger.Debug(ctx, "executing bucketed meter usage query",
 		"meter_id", params.MeterID,
 		"window_size", params.WindowSize,
 		"group_by", params.GroupByProperty,
@@ -384,6 +386,191 @@ func (r *MeterUsageRepository) GetDistinctMeterIDs(ctx context.Context, params *
 	return meterIDs, nil
 }
 
+// GetDetailedAnalytics provides comprehensive analytics with filtering, grouping, and time-series data.
+func (r *MeterUsageRepository) GetDetailedAnalytics(ctx context.Context, params *events.MeterUsageDetailedAnalyticsParams) ([]*events.MeterUsageDetailedResult, error) {
+	if params == nil {
+		return nil, ierr.NewError("params are required").Mark(ierr.ErrValidation)
+	}
+
+	// Parse and validate group-by columns
+	groupByResult, err := r.qb.BuildDetailedGroupByColumns(params)
+	if err != nil {
+		return nil, ierr.WithError(err).
+			WithHint("Invalid group_by configuration").
+			Mark(ierr.ErrValidation)
+	}
+
+	// Check if source is in group_by
+	sourceInGroupBy := false
+	for _, g := range params.GroupBy {
+		if g == "source" {
+			sourceInGroupBy = true
+			break
+		}
+	}
+
+	// Build SELECT columns: group-by aliases + aggregation columns
+	selectColumns := make([]string, 0, len(groupByResult.Aliases)+6)
+	if len(groupByResult.Aliases) > 0 {
+		selectColumns = append(selectColumns, groupByResult.Aliases...)
+	}
+	aggColumns := buildMeterUsageAggregationColumns(params.AggregationTypes)
+	selectColumns = append(selectColumns, aggColumns...)
+	if !sourceInGroupBy {
+		selectColumns = append(selectColumns, "groupUniqArray(source) AS sources")
+	}
+
+	// Build WHERE clause
+	where, args := r.qb.BuildDetailedWhereClause(params)
+	finalClause, settings := r.qb.BuildFinalClause(params.UseFinal)
+
+	query := fmt.Sprintf(`
+		SELECT
+			%s
+		FROM meter_usage %s
+		WHERE %s
+	`, joinSelect(selectColumns), finalClause, where)
+
+	if len(groupByResult.Columns) > 0 {
+		query += " GROUP BY " + joinSelect(groupByResult.Columns)
+	}
+
+	if settings != "" {
+		query += "\n" + settings
+	}
+
+	r.logger.Debug(ctx, "executing detailed meter usage analytics query",
+		"query", query,
+		"group_by", params.GroupBy,
+		"property_filters", params.PropertyFilters,
+	)
+
+	rows, err := r.store.GetConn().Query(ctx, query, args...)
+	if err != nil {
+		return nil, ierr.WithError(err).
+			WithHint("Failed to execute detailed meter usage analytics query").
+			Mark(ierr.ErrDatabase)
+	}
+	defer rows.Close()
+
+	var results []*events.MeterUsageDetailedResult
+
+	for rows.Next() {
+		result := &events.MeterUsageDetailedResult{
+			Properties: make(map[string]string),
+			Points:     make([]events.MeterUsageDetailedPoint, 0),
+		}
+
+		// Build scan targets: group-by columns + 5 aggregation values + optional sources
+		totalGroupByCols := len(groupByResult.Columns)
+		expectedCols := totalGroupByCols + 5 // total_usage, max_usage, latest_usage, count_unique_usage, event_count
+		if !sourceInGroupBy {
+			expectedCols++ // sources array
+		}
+
+		scanArgs := make([]interface{}, expectedCols)
+		groupByTargets := make([]string, totalGroupByCols)
+		for i := range groupByTargets {
+			scanArgs[i] = &groupByTargets[i]
+		}
+
+		scanArgs[totalGroupByCols] = &result.TotalUsage
+		scanArgs[totalGroupByCols+1] = &result.MaxUsage
+		scanArgs[totalGroupByCols+2] = &result.LatestUsage
+		scanArgs[totalGroupByCols+3] = &result.CountUniqueUsage
+		scanArgs[totalGroupByCols+4] = &result.EventCount
+		if !sourceInGroupBy {
+			result.Sources = []string{}
+			scanArgs[totalGroupByCols+5] = &result.Sources
+		}
+
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, ierr.WithError(err).
+				WithHint("Failed to scan detailed meter usage analytics row").
+				Mark(ierr.ErrDatabase)
+		}
+
+		// Map scanned group-by values to result fields
+		for i, col := range groupByResult.Columns {
+			value := groupByTargets[i]
+			switch col {
+			case "meter_id":
+				result.MeterID = value
+			case "source":
+				result.Source = value
+			default:
+				// Property group-by: extract property name from JSONExtractString expression
+				if strings.HasPrefix(col, "JSONExtractString(properties, '") {
+					start := len("JSONExtractString(properties, '")
+					end := strings.Index(col[start:], "'")
+					if end > 0 {
+						propName := col[start : start+end]
+						result.Properties[propName] = value
+					}
+				}
+			}
+		}
+
+		// Fetch time-series points if window_size is specified
+		if params.WindowSize != "" {
+			points, err := r.getDetailedAnalyticsPoints(ctx, params, result, groupByResult)
+			if err != nil {
+				return nil, err
+			}
+			result.Points = points
+		}
+
+		results = append(results, result)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, ierr.WithError(err).
+			WithHint("Error iterating detailed meter usage analytics rows").
+			Mark(ierr.ErrDatabase)
+	}
+
+	return results, nil
+}
+
+// getDetailedAnalyticsPoints fetches time-series breakdown for a single group result.
+func (r *MeterUsageRepository) getDetailedAnalyticsPoints(
+	ctx context.Context,
+	params *events.MeterUsageDetailedAnalyticsParams,
+	result *events.MeterUsageDetailedResult,
+	groupByResult *DetailedGroupByResult,
+) ([]events.MeterUsageDetailedPoint, error) {
+	query, args := r.qb.BuildDetailedPointsQuery(params, result, groupByResult)
+	if query == "" {
+		return nil, nil
+	}
+
+	rows, err := r.store.GetConn().Query(ctx, query, args...)
+	if err != nil {
+		return nil, ierr.WithError(err).
+			WithHint("Failed to query detailed meter usage analytics points").
+			Mark(ierr.ErrDatabase)
+	}
+	defer rows.Close()
+
+	var points []events.MeterUsageDetailedPoint
+	for rows.Next() {
+		var p events.MeterUsageDetailedPoint
+		if err := rows.Scan(&p.WindowStart, &p.TotalUsage, &p.MaxUsage, &p.LatestUsage, &p.CountUniqueUsage, &p.EventCount); err != nil {
+			return nil, ierr.WithError(err).
+				WithHint("Failed to scan detailed meter usage analytics point").
+				Mark(ierr.ErrDatabase)
+		}
+		points = append(points, p)
+	}
+
+	return points, nil
+}
+
+// joinSelect joins select columns with comma+newline for readability
+func joinSelect(cols []string) string {
+	return strings.Join(cols, ",\n\t\t\t")
+}
+
 // getMeterUsageAggExprs returns the SQL expression pair for a given aggregator.
 // This bridges the aggregator strategy with multi-meter queries that need raw expressions.
 func getMeterUsageAggExprs(agg MeterUsageAggregator) (aggExpr string, countExpr string) {
@@ -401,10 +588,228 @@ func getMeterUsageAggExprs(agg MeterUsageAggregator) (aggExpr string, countExpr 
 	case *MeterUsageAvgAggregator:
 		aggExpr = "AVG(qty_total)"
 	case *MeterUsageLatestAggregator:
-		aggExpr = fmt.Sprintf("argMax(qty_total, timestamp)")
+		aggExpr = "argMax(qty_total, timestamp)"
 	default:
 		aggExpr = "SUM(qty_total)"
 	}
 
 	return aggExpr, countExpr
+}
+
+// buildMeterUsageAggregationColumns builds SQL aggregation columns for meter_usage
+// analytics queries.
+//
+// Unlike feature_usage's buildConditionalAggregationColumns (where total_usage
+// only holds a real value when SUM is in the aggregation set), here total_usage
+// always holds the PRIMARY aggregation result regardless of type — COUNT meters
+// get total_usage = COUNT(DISTINCT id), MAX meters get total_usage = MAX(qty_total),
+// etc. Priority order matches frequency (SUM → COUNT → COUNT_UNIQUE → MAX → AVG → LATEST).
+//
+// This keeps the Go-side simple: r.TotalUsage and p.TotalUsage carry the
+// aggregation-aware value with no further routing needed. The per-type columns
+// (max_usage, latest_usage, count_unique_usage) remain so multi-aggregation
+// queries still get all values in a single round-trip; for single-aggregation
+// queries (the common case) total_usage and the matching per-type column will
+// hold the same value, which is harmless.
+func buildMeterUsageAggregationColumns(aggTypes []types.AggregationType) []string {
+	aggSet := make(map[types.AggregationType]bool, len(aggTypes))
+	for _, aggType := range aggTypes {
+		aggSet[aggType] = true
+	}
+
+	var primaryExpr string
+	switch {
+	case aggSet[types.AggregationSum]:
+		primaryExpr = "SUM(qty_total)"
+	case aggSet[types.AggregationCount]:
+		primaryExpr = "COUNT(DISTINCT id)"
+	case aggSet[types.AggregationCountUnique]:
+		primaryExpr = "COUNT(DISTINCT unique_hash)"
+	case aggSet[types.AggregationMax]:
+		primaryExpr = "MAX(qty_total)"
+	case aggSet[types.AggregationAvg]:
+		primaryExpr = "AVG(qty_total)"
+	case aggSet[types.AggregationLatest]:
+		primaryExpr = "argMax(qty_total, timestamp)"
+	default:
+		primaryExpr = "toDecimal128(0, 9)"
+	}
+
+	columns := []string{primaryExpr + " AS total_usage"}
+
+	if aggSet[types.AggregationMax] {
+		columns = append(columns, "MAX(qty_total) AS max_usage")
+	} else {
+		columns = append(columns, "toDecimal128(0, 9) AS max_usage")
+	}
+
+	if aggSet[types.AggregationLatest] {
+		columns = append(columns, "argMax(qty_total, timestamp) AS latest_usage")
+	} else {
+		columns = append(columns, "toDecimal128(0, 9) AS latest_usage")
+	}
+
+	if aggSet[types.AggregationCountUnique] {
+		columns = append(columns, "COUNT(DISTINCT unique_hash) AS count_unique_usage")
+	} else {
+		columns = append(columns, "toUInt64(0) AS count_unique_usage")
+	}
+
+	// event_count is the total distinct event count for every query.
+	columns = append(columns, "COUNT(DISTINCT id) AS event_count")
+
+	return columns
+}
+
+// GetMeterUsageForExport retrieves meter usage data for export in batches.
+func (r *MeterUsageRepository) GetMeterUsageForExport(ctx context.Context, startTime, endTime time.Time, batchSize int, offset int) ([]*events.MeterUsage, error) {
+	tenantID := types.GetTenantID(ctx)
+	environmentID := types.GetEnvironmentID(ctx)
+
+	query := `
+		SELECT
+			id,
+			tenant_id,
+			environment_id,
+			external_customer_id,
+			event_name,
+			source,
+			timestamp,
+			ingested_at,
+			properties,
+			meter_id,
+			qty_total,
+			unique_hash
+		FROM meter_usage FINAL
+		WHERE tenant_id = ?
+		  AND environment_id = ?
+		  AND timestamp >= ?
+		  AND timestamp < ?
+		ORDER BY timestamp DESC
+		LIMIT ? OFFSET ?
+		SETTINGS max_memory_usage = 96636764160
+	`
+
+	rows, err := r.store.GetConn().Query(ctx, query, tenantID, environmentID, startTime, endTime, batchSize, offset)
+	if err != nil {
+		return nil, ierr.WithError(err).
+			WithHint("Failed to query meter_usage for export in batch").
+			WithReportableDetails(map[string]interface{}{
+				"batch_size": batchSize,
+				"offset":     offset,
+			}).
+			Mark(ierr.ErrDatabase)
+	}
+	defer rows.Close()
+
+	var results []*events.MeterUsage
+	for rows.Next() {
+		var usage events.MeterUsage
+		var propertiesJSON string
+
+		if err := rows.Scan(
+			&usage.ID,
+			&usage.TenantID,
+			&usage.EnvironmentID,
+			&usage.ExternalCustomerID,
+			&usage.EventName,
+			&usage.Source,
+			&usage.Timestamp,
+			&usage.IngestedAt,
+			&propertiesJSON,
+			&usage.MeterID,
+			&usage.QtyTotal,
+			&usage.UniqueHash,
+		); err != nil {
+			return nil, ierr.WithError(err).
+				WithHint("Failed to scan meter_usage row").
+				Mark(ierr.ErrDatabase)
+		}
+
+		if propertiesJSON != "" {
+			if err := json.Unmarshal([]byte(propertiesJSON), &usage.Properties); err != nil {
+				r.logger.Info(ctx, "failed to parse properties JSON",
+					"event_id", usage.ID,
+					"error", err)
+				usage.Properties = make(map[string]interface{})
+			}
+		}
+
+		results = append(results, &usage)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, ierr.WithError(err).
+			WithHint("Error iterating meter_usage rows").
+			Mark(ierr.ErrDatabase)
+	}
+
+	r.logger.Debug(ctx, "meter_usage export batch query completed",
+		"tenant_id", tenantID,
+		"environment_id", environmentID,
+		"batch_size", batchSize,
+		"offset", offset,
+		"records_in_batch", len(results))
+
+	return results, nil
+}
+
+// GetByEventID returns the meter_usage record for a single event, or nil if not yet processed.
+func (r *MeterUsageRepository) GetByEventID(ctx context.Context, tenantID, environmentID, eventID string) (*events.MeterUsage, error) {
+	query := `
+		SELECT
+			id,
+			tenant_id,
+			environment_id,
+			external_customer_id,
+			event_name,
+			source,
+			timestamp,
+			ingested_at,
+			properties,
+			meter_id,
+			qty_total,
+			unique_hash
+		FROM meter_usage
+		WHERE tenant_id = ?
+		  AND environment_id = ?
+		  AND id = ?
+		LIMIT 1
+		SETTINGS max_memory_usage = 96636764160
+	`
+
+	var usage events.MeterUsage
+	var propertiesJSON string
+
+	err := r.store.GetConn().QueryRow(ctx, query, tenantID, environmentID, eventID).Scan(
+		&usage.ID,
+		&usage.TenantID,
+		&usage.EnvironmentID,
+		&usage.ExternalCustomerID,
+		&usage.EventName,
+		&usage.Source,
+		&usage.Timestamp,
+		&usage.IngestedAt,
+		&propertiesJSON,
+		&usage.MeterID,
+		&usage.QtyTotal,
+		&usage.UniqueHash,
+	)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			return nil, nil
+		}
+		return nil, ierr.WithError(err).
+			WithHint("Failed to query meter_usage by event ID").
+			Mark(ierr.ErrDatabase)
+	}
+
+	if propertiesJSON != "" {
+		if err := json.Unmarshal([]byte(propertiesJSON), &usage.Properties); err != nil {
+			r.logger.Error(ctx, "failed to parse properties JSON", "event_id", usage.ID, "error", err)
+			usage.Properties = make(map[string]interface{})
+		}
+	}
+
+	return &usage, nil
 }

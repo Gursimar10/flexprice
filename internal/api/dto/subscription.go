@@ -21,10 +21,13 @@ type SubscriptionPhaseCreateRequest struct {
 	StartDate time.Time  `json:"start_date" validate:"required"`
 	EndDate   *time.Time `json:"end_date,omitempty"`
 
-	// Coupons represents subscription-level coupons to be applied to this phase
+	// SubscriptionCoupons is the preferred way to attach coupons to this phase.
+	SubscriptionCoupons []SubscriptionCouponInput `json:"subscription_coupons,omitempty"`
+
+	// Deprecated: use SubscriptionCoupons instead.
 	Coupons []string `json:"coupons,omitempty"`
 
-	// LineItemCoupons represents line item-level coupons (map of line_item_id to coupon IDs)
+	// Deprecated: use SubscriptionCoupons instead.
 	LineItemCoupons map[string][]string `json:"line_item_coupons,omitempty"`
 
 	// OverrideLineItems allows customizing specific prices for this phase
@@ -100,6 +103,19 @@ type LineItemCommitmentConfig struct {
 
 	// CommitmentDuration is the time frame of the commitment (e.g., ANNUAL commitment on MONTHLY billing)
 	CommitmentDuration *types.BillingPeriod `json:"commitment_duration,omitempty"`
+
+	// CommitmentTimeBuckets defines per-bucket commitment + inline price for
+	// windows whose start UTC hour falls within each configured bucket. Each
+	// bucket carries its own price (materialized by the service). Requires
+	// IsWindowCommitment=true.
+	CommitmentTimeBuckets []CommitmentBucketRequest `json:"commitment_time_buckets,omitempty"`
+}
+
+// ToDomainBuckets maps the config's bucket requests to domain buckets (IDs +
+// commitment fields, empty PriceIDs); the service materializes a price per
+// bucket and fills in the PriceIDs.
+func (c *LineItemCommitmentConfig) ToDomainBuckets() types.TimeOfDayBuckets {
+	return bucketRequestsToDomain(c.CommitmentTimeBuckets)
 }
 
 // validateLineItemCommitments validates a map of price_id -> commitment configuration.
@@ -235,6 +251,19 @@ func (c *LineItemCommitmentConfig) Validate() error {
 			Mark(ierr.ErrValidation)
 	}
 
+	// Rule 5: commitment_time_buckets only constrains the per-window application
+	// path — it has no meaning without is_window_commitment=true.
+	if len(c.CommitmentTimeBuckets) > 0 {
+		if c.IsWindowCommitment == nil || !*c.IsWindowCommitment {
+			return ierr.NewError("commitment_time_buckets requires is_window_commitment=true").
+				WithHint("Set is_window_commitment=true to apply commitment only during the configured hours").
+				Mark(ierr.ErrValidation)
+		}
+		if err := validateTimeOfDayBuckets(c.CommitmentTimeBuckets); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -265,6 +294,34 @@ func (r *SubscriptionCouponRequest) Validate() error {
 		}
 	}
 
+	return nil
+}
+
+// SubscriptionCouponInput is the preferred coupon attachment request.
+// Identifies a coupon by human-readable code (never internal ID).
+// Optionally targets a specific subscription line item via price_id.
+type SubscriptionCouponInput struct {
+	// CouponCode is the coupon's human-readable code (case-insensitive). Required.
+	CouponCode string `json:"coupon_code" validate:"required"`
+	// StartDate is when the coupon starts; defaults to subscription/phase StartDate.
+	StartDate *time.Time `json:"start_date,omitempty"`
+	// EndDate is when the coupon ends; overrides duration_in_periods calculation.
+	EndDate *time.Time `json:"end_date,omitempty"`
+	// PriceID is the price ID of the line item to target; omit for subscription-level.
+	PriceID *string `json:"price_id,omitempty"`
+}
+
+// Validate validates SubscriptionCouponInput.
+func (r *SubscriptionCouponInput) Validate() error {
+	if r.CouponCode == "" {
+		return ierr.NewError("coupon_code is required").
+			WithHint("Provide a valid coupon code").
+			Mark(ierr.ErrValidation)
+	}
+	if r.EndDate != nil && r.StartDate != nil && r.EndDate.Before(*r.StartDate) {
+		return ierr.NewError("end_date cannot be before start_date").
+			Mark(ierr.ErrValidation)
+	}
 	return nil
 }
 
@@ -342,6 +399,12 @@ func (c *SubscriptionInheritanceConfig) Validate() error {
 }
 
 type CreateSubscriptionRequest struct {
+	// ID is an optional pre-generated subscription ID for internal use only.
+	// This exists as a temporary patch to allow Paddle entity mapping to be created
+	// before the subscription row is written, so both share the same transaction.
+	// TODO: Remove once plan-change integration carryover is handled generically.
+	// Never populated from external JSON.
+	ID string `json:"-"`
 
 	// customer_id is the flexprice customer id
 	// and it is prioritized over external_customer_id in case both are provided.
@@ -394,8 +457,14 @@ type CreateSubscriptionRequest struct {
 	// tax_rate_overrides is the tax rate overrides	to be applied to the subscription
 	TaxRateOverrides []*TaxRateOverride `json:"tax_rate_overrides,omitempty"`
 
+	// SubscriptionCoupons is the preferred way to attach coupons at creation.
+	// Accepts coupon_code; optionally targets a line item via price_id.
+	SubscriptionCoupons []SubscriptionCouponInput `json:"subscription_coupons,omitempty"`
+
+	// Deprecated: use SubscriptionCoupons instead.
 	Coupons []string `json:"coupons,omitempty"`
 
+	// Deprecated: use SubscriptionCoupons instead.
 	LineItemCoupons map[string][]string `json:"line_item_coupons,omitempty"`
 
 	// LineItemCommitments allows setting commitment configuration per line item (keyed by price_id)
@@ -452,6 +521,13 @@ type CreateSubscriptionRequest struct {
 
 	// Enable Commitment True Up Fee
 	EnableTrueUp bool `json:"enable_true_up"`
+
+	// AutoInvoiceThreshold is the usage amount (in subscription currency) that triggers
+	// an intermediate invoice mid-period. Set once at creation; cannot be changed later.
+	// Allowed only when the subscription resolves to type standalone (no parent hierarchy rows).
+	// Plan line items must be usage-based only (no fixed or other non-usage plan prices).
+	// Nil means auto invoice threshold billing is disabled for this subscription.
+	AutoInvoiceThreshold *decimal.Decimal `json:"auto_invoice_threshold,omitempty" swaggertype:"string"`
 
 	// Inheritance groups all customer-hierarchy fields.
 	// When provided with at least one child ID, the subscription becomes a PARENT type.
@@ -528,6 +604,10 @@ type CancelSubscriptionRequest struct {
 	// Reason for cancellation (for audit and business intelligence)
 	Reason string `json:"reason,omitempty"`
 
+	// CancelAt is the exact date/time when the subscription should be cancelled.
+	// Required for cancellation_type "scheduled_date"; optional for "immediate" (past dates only — backdated cancellation).
+	// For "scheduled_date", accepts both future dates (deferred cancellation) and past dates (backdated cancellation).
+	// For "immediate", accepts past/current dates only; use "scheduled_date" for future dates.
 	CancelAt *time.Time `json:"cancel_at,omitempty"`
 
 	//SuppressWebhook is an internal flag to suppress webhook events during cancellation.
@@ -590,13 +670,16 @@ func (r *CancelSubscriptionRequest) Validate() error {
 	if r.CancellationType == types.CancellationTypeScheduledDate {
 		if r.CancelAt == nil {
 			return ierr.NewError("cancel_at is required for scheduled_date").
-				WithHint("Provide a future date in cancel_at").
+				WithHint("Provide a cancel_at date (past for backdated cancellation, future for scheduled cancellation)").
 				Mark(ierr.ErrValidation)
 		}
+	}
+
+	if r.CancellationType == types.CancellationTypeImmediate && r.CancelAt != nil {
 		now := time.Now().UTC()
-		if !r.CancelAt.After(now) {
-			return ierr.NewError("cancel_at must be a future date for scheduled_date cancellation").
-				WithHint("Provide a date strictly in the future for cancel_at").
+		if r.CancelAt.After(now) {
+			return ierr.NewError("cancel_at cannot be a future date for immediate cancellation").
+				WithHint("Use cancellation_type 'scheduled_date' to schedule a future cancellation").
 				WithReportableDetails(map[string]interface{}{
 					"cancel_at": r.CancelAt.UTC().Format(time.RFC3339),
 				}).
@@ -674,6 +757,11 @@ type SubscriptionResponseV2 struct {
 
 	// Pauses are included when subscription has pause status
 	Pauses []*subscription.SubscriptionPause `json:"pauses,omitempty"`
+
+	// PlanPricesOutOfSync is true when the subscription's synced_price_sequence
+	// is behind the plan's current max prices.sequence — i.e. plan-price
+	// changes have not yet been reconciled into this subscription's line items.
+	PlanPricesOutOfSync bool `json:"plan_prices_out_of_sync"`
 }
 
 func (r *CreateSubscriptionRequest) Validate() error {
@@ -685,6 +773,14 @@ func (r *CreateSubscriptionRequest) Validate() error {
 
 	if r.OpeningInvoiceAdjustmentAmount != nil && r.OpeningInvoiceAdjustmentAmount.IsNegative() {
 		return ierr.NewError("opening invoice adjustment amount must be >= 0").
+			Mark(ierr.ErrValidation)
+	}
+
+	if r.AutoInvoiceThreshold != nil && r.AutoInvoiceThreshold.IsNegative() {
+		return ierr.NewError("auto_invoice_threshold must be zero or greater").
+			WithReportableDetails(map[string]any{
+				"auto_invoice_threshold": r.AutoInvoiceThreshold.String(),
+			}).
 			Mark(ierr.ErrValidation)
 	}
 
@@ -1226,8 +1322,13 @@ func (r *CreateSubscriptionRequest) ToSubscription(ctx context.Context) *subscri
 		trialStart, trialEnd = r.TrialStart, r.TrialEnd
 	}
 
+	subID := r.ID
+	if subID == "" {
+		subID = types.GenerateUUIDWithPrefix(types.UUID_PREFIX_SUBSCRIPTION)
+	}
+
 	sub := &subscription.Subscription{
-		ID:                 types.GenerateUUIDWithPrefix(types.UUID_PREFIX_SUBSCRIPTION),
+		ID:                 subID,
 		CustomerID:         r.CustomerID,
 		PlanID:             r.PlanID,
 		Currency:           strings.ToLower(r.Currency),
@@ -1272,6 +1373,10 @@ func (r *CreateSubscriptionRequest) ToSubscription(ctx context.Context) *subscri
 		sub.OverageFactor = lo.ToPtr(decimal.NewFromInt(1)) // Default value
 	}
 
+	if r.AutoInvoiceThreshold != nil {
+		sub.AutoInvoiceThreshold = r.AutoInvoiceThreshold
+	}
+
 	return sub
 }
 
@@ -1290,6 +1395,8 @@ type SubscriptionLineItemRequest struct {
 	CommitmentTrueUpEnabled bool                 `json:"commitment_true_up_enabled,omitempty"`
 	CommitmentWindowed      bool                 `json:"commitment_windowed,omitempty"`
 	CommitmentDuration      *types.BillingPeriod `json:"commitment_duration,omitempty"`
+	// CommitmentTimeBuckets - if provided, applies commitment only in specified time buckets
+	CommitmentTimeBuckets types.TimeOfDayBuckets `json:"commitment_time_buckets,omitempty"`
 }
 
 // SubscriptionLineItemResponse represents the response for a subscription line item
@@ -1711,6 +1818,9 @@ func (r *SubscriptionLineItemRequest) ToSubscriptionLineItem(ctx context.Context
 	if r.CommitmentDuration != nil {
 		lineItem.CommitmentDuration = r.CommitmentDuration
 	}
+	if len(r.CommitmentTimeBuckets) > 0 {
+		lineItem.CommitmentTimeBuckets = r.CommitmentTimeBuckets
+	}
 
 	return lineItem
 }
@@ -1770,6 +1880,23 @@ type SubscriptionUpdatePeriodResponseItem struct {
 	PeriodEnd      time.Time `json:"period_end"`
 	Success        bool      `json:"success"`
 	Error          string    `json:"error"`
+}
+
+// AutoInvoiceThresholdBillingResult is the result of a single ProcessAutoInvoiceThresholdBilling run.
+type AutoInvoiceThresholdBillingResult struct {
+	TotalChecked  int                                      `json:"total_checked"`
+	TotalInvoiced int                                      `json:"total_invoiced"`
+	TotalSkipped  int                                      `json:"total_skipped"`
+	TotalFailed   int                                      `json:"total_failed"`
+	Items         []*AutoInvoiceThresholdBillingResultItem `json:"items,omitempty"`
+}
+
+// AutoInvoiceThresholdBillingResultItem is the per-subscription outcome for auto invoice threshold billing.
+type AutoInvoiceThresholdBillingResultItem struct {
+	SubscriptionID string `json:"subscription_id"`
+	Invoiced       bool   `json:"invoiced"`
+	InvoiceID      string `json:"invoice_id,omitempty"`
+	Error          string `json:"error,omitempty"`
 }
 
 // GetUpcomingCreditGrantApplicationsRequest represents the request to get upcoming credit grant applications

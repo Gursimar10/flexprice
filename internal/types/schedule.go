@@ -13,13 +13,15 @@ import (
 type ScheduleID string
 
 const (
-	ScheduleIDCreditGrantProcessing        ScheduleID = "credit-grants-processing"
-	ScheduleIDSubscriptionAutoCancellation ScheduleID = "subscription-auto-cancellation"
-	ScheduleIDWalletCreditExpiry           ScheduleID = "wallet-credit-expiry"
-	ScheduleIDSubscriptionBilling          ScheduleID = "subscription-billing"
-	ScheduleIDSubscriptionRenewalAlerts    ScheduleID = "subscription-renewal-due-alerts"
-	ScheduleIDSubscriptionTrialEndDue      ScheduleID = "subscription-trial-end-due"
-	ScheduleIDOutboundWebhookStaleRetry    ScheduleID = "webhook-stale-retry"
+	ScheduleIDCreditGrantProcessing                   ScheduleID = "credit-grants-processing"
+	ScheduleIDSubscriptionAutoCancellation            ScheduleID = "subscription-auto-cancellation"
+	ScheduleIDWalletCreditExpiry                      ScheduleID = "wallet-credit-expiry"
+	ScheduleIDSubscriptionBilling                     ScheduleID = "subscription-billing"
+	ScheduleIDSubscriptionRenewalAlerts               ScheduleID = "subscription-renewal-due-alerts"
+	ScheduleIDSubscriptionTrialEndDue                 ScheduleID = "subscription-trial-end-due"
+	ScheduleIDSubscriptionAutoInvoiceThresholdBilling ScheduleID = "subscription-auto-invoice-threshold-billing"
+	ScheduleIDOutboundWebhookStaleRetry               ScheduleID = "webhook-stale-retry"
+	ScheduleIDPaddleInvoicePullSync                   ScheduleID = "paddle-invoice-pull-sync"
 )
 
 // String returns the raw schedule id.
@@ -35,7 +37,9 @@ func AllTemporalServerScheduleIDs() []ScheduleID {
 		ScheduleIDSubscriptionBilling,
 		ScheduleIDSubscriptionRenewalAlerts,
 		ScheduleIDSubscriptionTrialEndDue,
+		ScheduleIDSubscriptionAutoInvoiceThresholdBilling,
 		ScheduleIDOutboundWebhookStaleRetry,
+		ScheduleIDPaddleInvoicePullSync,
 	}
 }
 

@@ -51,6 +51,7 @@ func (s *entityIntegrationMappingService) CreateEntityIntegrationMapping(ctx con
 		EnvironmentID:    mapping.EnvironmentID,
 		TenantID:         mapping.TenantID,
 		Status:           mapping.Status,
+		Metadata:         mapping.Metadata,
 		CreatedAt:        mapping.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 		UpdatedAt:        mapping.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 		CreatedBy:        mapping.CreatedBy,
@@ -80,6 +81,7 @@ func (s *entityIntegrationMappingService) GetEntityIntegrationMapping(ctx contex
 		EnvironmentID:    mapping.EnvironmentID,
 		TenantID:         mapping.TenantID,
 		Status:           mapping.Status,
+		Metadata:         mapping.Metadata,
 		CreatedAt:        mapping.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 		UpdatedAt:        mapping.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 		CreatedBy:        mapping.CreatedBy,
@@ -123,6 +125,7 @@ func (s *entityIntegrationMappingService) GetEntityIntegrationMappings(ctx conte
 			EnvironmentID:    m.EnvironmentID,
 			TenantID:         m.TenantID,
 			Status:           m.Status,
+			Metadata:         m.Metadata,
 			CreatedAt:        m.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 			UpdatedAt:        m.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 			CreatedBy:        m.CreatedBy,
@@ -159,7 +162,12 @@ func (s *entityIntegrationMappingService) UpdateEntityIntegrationMapping(ctx con
 	}
 
 	if req.Metadata != nil {
-		mapping.Metadata = req.Metadata
+		if mapping.Metadata == nil {
+			mapping.Metadata = make(map[string]interface{})
+		}
+		for k, v := range req.Metadata {
+			mapping.Metadata[k] = v
+		}
 	}
 
 	// Update timestamps
@@ -186,6 +194,7 @@ func (s *entityIntegrationMappingService) UpdateEntityIntegrationMapping(ctx con
 		EnvironmentID:    mapping.EnvironmentID,
 		TenantID:         mapping.TenantID,
 		Status:           mapping.Status,
+		Metadata:         mapping.Metadata,
 		CreatedAt:        mapping.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 		UpdatedAt:        mapping.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 		CreatedBy:        mapping.CreatedBy,
@@ -219,11 +228,24 @@ func (s *entityIntegrationMappingService) LinkIntegrationMapping(ctx context.Con
 		return nil, err
 	}
 
-	mapping, err := s.upsertEntityMapping(ctx, req)
+	connections, err := s.ConnectionRepo.List(ctx, &types.ConnectionFilter{
+		QueryFilter:  types.NewNoLimitPublishedQueryFilter(),
+		ProviderType: types.SecretProvider(req.ProviderType),
+	})
 	if err != nil {
 		return nil, err
 	}
+	if len(connections) == 0 {
+		return nil, ierr.NewError(fmt.Sprintf("no active connection found for provider %s", req.ProviderType)).
+			WithHint("Create a connection for this provider before linking entities").
+			Mark(ierr.ErrValidation)
+	}
+
 	if err := s.applyEntitySideEffects(ctx, req); err != nil {
+		return nil, err
+	}
+	mapping, err := s.upsertEntityMapping(ctx, req)
+	if err != nil {
 		return nil, err
 	}
 
@@ -237,11 +259,57 @@ func (s *entityIntegrationMappingService) LinkIntegrationMapping(ctx context.Con
 			EnvironmentID:    mapping.EnvironmentID,
 			TenantID:         mapping.TenantID,
 			Status:           mapping.Status,
+			Metadata:         mapping.Metadata,
 			CreatedAt:        mapping.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 			UpdatedAt:        mapping.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 			CreatedBy:        mapping.CreatedBy,
 			UpdatedBy:        mapping.UpdatedBy,
 		},
+	}, nil
+}
+
+func (s *entityIntegrationMappingService) DelinkIntegrationMapping(ctx context.Context, req dto.DelinkIntegrationMappingRequest) (*dto.SuccessResponse, error) {
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
+
+	filter := &types.EntityIntegrationMappingFilter{
+		QueryFilter: types.NewNoLimitPublishedQueryFilter(),
+		EntityID:    req.EntityID,
+		EntityType:  req.EntityType,
+		ProviderTypes: []string{
+			req.ProviderType,
+		},
+	}
+	mappings, err := s.EntityIntegrationMappingRepo.List(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(mappings) == 0 {
+		return nil, ierr.NewError("no entity integration mapping found to delink").
+			WithHint("No active mapping exists for the given entity and provider").
+			WithReportableDetails(map[string]any{
+				"entity_id":     req.EntityID,
+				"entity_type":   req.EntityType,
+				"provider_type": req.ProviderType,
+			}).
+			Mark(ierr.ErrNotFound)
+	}
+
+	if err := s.DB.WithTx(ctx, func(txCtx context.Context) error {
+		for _, mapping := range mappings {
+			if err := s.EntityIntegrationMappingRepo.Delete(txCtx, mapping); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return &dto.SuccessResponse{
+		Message: "Integration mapping delinked successfully",
 	}, nil
 }
 
@@ -302,9 +370,7 @@ func (s *entityIntegrationMappingService) applyEntitySideEffects(ctx context.Con
 	case types.IntegrationEntityTypeCustomer:
 		return s.applyCustomerLinkSideEffects(ctx, req)
 	default:
-		return ierr.NewError("unsupported entity type for link side effects").
-			WithHint(fmt.Sprintf("Entity type %s is not supported yet", req.EntityType)).
-			Mark(ierr.ErrValidation)
+		return nil
 	}
 }
 
@@ -313,9 +379,7 @@ func (s *entityIntegrationMappingService) applyCustomerLinkSideEffects(ctx conte
 	case types.SecretProviderRazorpay:
 		return s.applyRazorpayCustomerLinkSideEffects(ctx, req)
 	default:
-		return ierr.NewError("unsupported provider for customer link").
-			WithHint(fmt.Sprintf("Provider %s is not supported yet for customer links", req.ProviderType)).
-			Mark(ierr.ErrValidation)
+		return nil
 	}
 }
 
@@ -334,14 +398,14 @@ func (s *entityIntegrationMappingService) applyRazorpayCustomerLinkSideEffects(c
 
 	razorpayIntegration, err := s.IntegrationFactory.GetRazorpayIntegration(ctx)
 	if err != nil {
-		s.Logger.WarnwCtx(ctx, "razorpay integration unavailable for customer notes update", "error", err, "customer_id", req.EntityID, "provider_entity_id", req.ProviderEntityID)
+		s.Logger.Info(ctx, "razorpay integration unavailable for customer notes update", "error", err, "customer_id", req.EntityID, "provider_entity_id", req.ProviderEntityID)
 		return nil
 	}
 	if err := razorpayIntegration.CustomerSvc.UpdateRazorpayCustomerNotes(ctx, req.ProviderEntityID, map[string]interface{}{
 		"flexprice_customer_id": req.EntityID,
 		"environment_id":        types.GetEnvironmentID(ctx),
 	}); err != nil {
-		s.Logger.WarnwCtx(ctx, "failed to update razorpay customer notes", "error", err, "customer_id", req.EntityID, "provider_entity_id", req.ProviderEntityID)
+		s.Logger.Info(ctx, "failed to update razorpay customer notes", "error", err, "customer_id", req.EntityID, "provider_entity_id", req.ProviderEntityID)
 		return nil
 	}
 	return nil

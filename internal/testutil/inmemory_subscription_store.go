@@ -8,6 +8,7 @@ import (
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/types"
 	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
 )
 
 // InMemorySubscriptionStore implements subscription.Repository
@@ -473,19 +474,26 @@ func (s *InMemorySubscriptionStore) GetWithPauses(ctx context.Context, id string
 }
 
 // ListSubscriptionsDueForRenewal retrieves all active subscriptions that are due for renewal in 24 hours
-func (s *InMemorySubscriptionStore) ListSubscriptionsDueForRenewal(ctx context.Context) ([]*subscription.Subscription, error) {
-	// Create a filter for active subscriptions
+func (s *InMemorySubscriptionStore) ListSubscriptionsDueForRenewal(ctx context.Context, referenceTime time.Time) ([]*subscription.Subscription, error) {
+	referenceTime = referenceTime.UTC()
+	targetTime := referenceTime.Add(24 * time.Hour)
+	windowStart := targetTime.Add(-15 * time.Minute)
+
 	filter := &types.SubscriptionFilter{
 		QueryFilter: types.NewNoLimitQueryFilter(),
 		SubscriptionStatus: []types.SubscriptionStatus{
 			types.SubscriptionStatusActive,
 		},
-		TimeRangeFilter: &types.TimeRangeFilter{
-			EndTime: lo.ToPtr(time.Now().UTC().Add(24 * time.Hour)),
-		},
 	}
 
-	return s.ListAll(ctx, filter)
+	allSubs, err := s.ListAll(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+
+	return lo.Filter(allSubs, func(sub *subscription.Subscription, _ int) bool {
+		return !sub.CurrentPeriodEnd.Before(windowStart) && sub.CurrentPeriodEnd.Before(targetTime) && !sub.CancelAtPeriodEnd
+	}), nil
 }
 
 // GetRecentSubscriptionsByPlan returns subscription counts grouped by plan for last 7 days
@@ -532,6 +540,40 @@ func (s *InMemorySubscriptionStore) GetRecentSubscriptionsByPlan(ctx context.Con
 	}
 
 	return result, nil
+}
+
+// GetSubscriptionsWithAutoInvoiceThreshold returns active subscriptions where
+// auto_invoice_threshold is set on the subscription (see subscription.Repository).
+func (s *InMemorySubscriptionStore) GetSubscriptionsWithAutoInvoiceThreshold(ctx context.Context, limit, offset int) ([]*subscription.Subscription, error) {
+	all, err := s.ListAll(ctx, &types.SubscriptionFilter{
+		QueryFilter: types.NewNoLimitQueryFilter(),
+		SubscriptionStatus: []types.SubscriptionStatus{
+			types.SubscriptionStatusActive,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var results []*subscription.Subscription
+	for _, sub := range all {
+		if sub.SubscriptionType != types.SubscriptionTypeStandalone || sub.Status != types.StatusPublished {
+			continue
+		}
+		if sub.AutoInvoiceThreshold != nil && sub.AutoInvoiceThreshold.GreaterThan(decimal.Zero) {
+			results = append(results, sub)
+		}
+	}
+
+	// Apply offset and limit
+	if offset >= len(results) {
+		return []*subscription.Subscription{}, nil
+	}
+	results = results[offset:]
+	if limit > 0 && len(results) > limit {
+		results = results[:limit]
+	}
+	return results, nil
 }
 
 // Clear removes all data from the store

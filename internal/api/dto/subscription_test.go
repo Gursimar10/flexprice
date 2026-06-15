@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/flexprice/flexprice/internal/types"
+	"github.com/shopspring/decimal"
 )
 
 func baseCreateSubscriptionRequest() CreateSubscriptionRequest {
@@ -78,6 +79,115 @@ func TestCreateSubscriptionRequestValidate_BillingAnchorOnOrAfterStartDate(t *te
 		err := req.Validate()
 		if err != nil {
 			t.Fatalf("expected no error, got: %v", err)
+		}
+	})
+}
+
+func TestCancelSubscriptionRequest_Validate_BackdatedImmediate(t *testing.T) {
+	now := time.Now().UTC()
+	past := now.Add(-5 * 24 * time.Hour)
+	future := now.Add(5 * 24 * time.Hour)
+
+	tests := []struct {
+		name    string
+		req     CancelSubscriptionRequest
+		wantErr bool
+	}{
+		{
+			name: "immediate_no_cancel_at_is_valid",
+			req: CancelSubscriptionRequest{
+				CancellationType:  types.CancellationTypeImmediate,
+				ProrationBehavior: types.ProrationBehaviorNone,
+			},
+			wantErr: false,
+		},
+		{
+			name: "immediate_past_cancel_at_is_valid",
+			req: CancelSubscriptionRequest{
+				CancellationType:  types.CancellationTypeImmediate,
+				ProrationBehavior: types.ProrationBehaviorNone,
+				CancelAt:          &past,
+			},
+			wantErr: false,
+		},
+		{
+			name: "immediate_future_cancel_at_is_rejected",
+			req: CancelSubscriptionRequest{
+				CancellationType:  types.CancellationTypeImmediate,
+				ProrationBehavior: types.ProrationBehaviorNone,
+				CancelAt:          &future,
+			},
+			wantErr: true,
+		},
+		{
+			name: "scheduled_date_past_cancel_at_is_valid",
+			req: CancelSubscriptionRequest{
+				CancellationType:  types.CancellationTypeScheduledDate,
+				ProrationBehavior: types.ProrationBehaviorNone,
+				CancelAt:          &past,
+			},
+			wantErr: false,
+		},
+		{
+			name: "scheduled_date_future_cancel_at_is_valid",
+			req: CancelSubscriptionRequest{
+				CancellationType:  types.CancellationTypeScheduledDate,
+				ProrationBehavior: types.ProrationBehaviorNone,
+				CancelAt:          &future,
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.req.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatalf("expected validation error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestCreateSubscriptionRequestValidate_AutoInvoiceThreshold(t *testing.T) {
+	t.Run("nil passes", func(t *testing.T) {
+		req := baseCreateSubscriptionRequest()
+		if err := req.Validate(); err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+	})
+
+	t.Run("zero passes", func(t *testing.T) {
+		req := baseCreateSubscriptionRequest()
+		z := decimal.Zero
+		req.AutoInvoiceThreshold = &z
+		if err := req.Validate(); err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+	})
+
+	t.Run("positive passes", func(t *testing.T) {
+		req := baseCreateSubscriptionRequest()
+		p := decimal.RequireFromString("10")
+		req.AutoInvoiceThreshold = &p
+		if err := req.Validate(); err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+	})
+
+	t.Run("negative fails mentioning auto_invoice_threshold", func(t *testing.T) {
+		req := baseCreateSubscriptionRequest()
+		n := decimal.NewFromInt(-1)
+		req.AutoInvoiceThreshold = &n
+		err := req.Validate()
+		if err == nil {
+			t.Fatal("expected validation error, got nil")
+		}
+		if !strings.Contains(strings.ToLower(err.Error()), "auto_invoice_threshold") {
+			t.Fatalf("expected error to mention auto_invoice_threshold, got: %v", err)
 		}
 	})
 }

@@ -136,6 +136,16 @@ type Subscription struct {
 	// SubscriptionType categorises the subscription within a customer hierarchy (standalone, parent, inherited).
 	SubscriptionType types.SubscriptionType `db:"subscription_type" json:"subscription_type"`
 
+	// AutoInvoiceThreshold is the usage amount (in subscription currency) that triggers
+	// an intermediate invoice. Overrides the plan-level threshold when set.
+	// Nil means: inherit from the plan's threshold (which may also be nil = disabled).
+	AutoInvoiceThreshold *decimal.Decimal `db:"auto_invoice_threshold" json:"auto_invoice_threshold,omitempty" swaggertype:"string"`
+
+	// SyncedPriceSequence is the plan-price sequence up to which this
+	// subscription's line items have been reconciled. Bumped by the
+	// plan-price sync after a successful pass.
+	SyncedPriceSequence int64 `db:"synced_price_sequence" json:"synced_price_sequence,omitempty"`
+
 	types.BaseModel
 }
 
@@ -175,6 +185,12 @@ func (s *Subscription) HasCommitment() bool {
 		s.CommitmentAmount.GreaterThan(decimal.Zero) &&
 		s.OverageFactor != nil &&
 		s.OverageFactor.GreaterThan(decimal.NewFromInt(1))
+}
+
+// HasPositiveAutoInvoiceThreshold reports whether subscription-level mid-period
+// auto invoice threshold billing is configured (> 0). Matches cron/repo eligibility.
+func (s *Subscription) HasPositiveAutoInvoiceThreshold() bool {
+	return s.AutoInvoiceThreshold != nil && s.AutoInvoiceThreshold.GreaterThan(decimal.Zero)
 }
 
 func FromEntList(subs []*ent.Subscription) []*Subscription {
@@ -251,6 +267,8 @@ func GetSubscriptionFromEnt(sub *ent.Subscription) *Subscription {
 		ParentSubscriptionID: sub.ParentSubscriptionID,
 		PaymentTerms:         sub.PaymentTerms,
 		SubscriptionType:     types.SubscriptionType(sub.SubscriptionType),
+		AutoInvoiceThreshold: sub.AutoInvoiceThreshold,
+		SyncedPriceSequence:  sub.SyncedPriceSequence,
 		BaseModel: types.BaseModel{
 			TenantID:  sub.TenantID,
 			Status:    types.Status(sub.Status),

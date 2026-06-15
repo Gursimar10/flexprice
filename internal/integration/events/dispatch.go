@@ -61,6 +61,20 @@ func customerAlreadySynced(ctx context.Context, eimRepo entityintegrationmapping
 	return err == nil && count > 0
 }
 
+// subscriptionAlreadySynced returns true when the entity mapping table already has a record for
+// (subscriptionID, subscription, provider). Same idempotency guarantee as invoiceAlreadySynced.
+func subscriptionAlreadySynced(ctx context.Context, eimRepo entityintegrationmapping.Repository, subscriptionID string, provider types.SecretProvider) bool {
+	if eimRepo == nil {
+		return false
+	}
+	filter := types.NewNoLimitEntityIntegrationMappingFilter()
+	filter.EntityID = subscriptionID
+	filter.EntityType = types.IntegrationEntityTypeSubscription
+	filter.ProviderTypes = []string{string(provider)}
+	count, err := eimRepo.Count(ctx, filter)
+	return err == nil && count > 0
+}
+
 // invoiceVendorSyncInput holds the minimal data needed to dispatch a provider trigger.
 // Invoice and subscription details are fetched inside the Temporal activity after a
 // short sleep, avoiding races where the event arrives before the DB transaction commits.
@@ -101,7 +115,7 @@ func DispatchInvoiceVendorSync(
 		InvoiceID string `json:"invoice_id"`
 	}
 	if err := json.Unmarshal(event.Payload, &pl); err != nil || pl.InvoiceID == "" {
-		log.Errorw("integration_events: invalid invoice payload, dropping",
+		log.Error(ctx, "integration_events: invalid invoice payload, dropping",
 			"message_uuid", msgUUID,
 			"error", err,
 		)
@@ -120,7 +134,7 @@ func DispatchInvoiceVendorSync(
 		return errTemporalUnavailable
 	}
 
-	log.Infow("integration_events: dispatching invoice vendor sync",
+	log.Info(ctx, "integration_events: dispatching invoice vendor sync",
 		"invoice_id", in.InvoiceID,
 		"tenant_id", in.TenantID,
 		"environment_id", in.EnvironmentID,
@@ -137,6 +151,7 @@ func DispatchInvoiceVendorSync(
 		func() error { return triggerNomodIfEnabled(ctx, connRepo, eimRepo, temporalSvc, log, in) },
 		func() error { return triggerPaddleIfEnabled(ctx, connRepo, eimRepo, temporalSvc, log, in) },
 		func() error { return triggerZohoBooksIfEnabled(ctx, connRepo, eimRepo, temporalSvc, log, in) },
+		func() error { return triggerWhopIfEnabled(ctx, connRepo, eimRepo, temporalSvc, log, in) },
 	} {
 		if err := trigger(); err != nil {
 			dispatchErrs = append(dispatchErrs, err)
@@ -168,7 +183,7 @@ func DispatchCustomerVendorSync(
 
 	var payload webhookDto.InternalCustomerEvent
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
-		log.Errorw("integration_events: invalid customer payload, dropping",
+		log.Error(ctx, "integration_events: invalid customer payload, dropping",
 			"message_uuid", msgUUID,
 			"error", err,
 		)
@@ -176,7 +191,7 @@ func DispatchCustomerVendorSync(
 	}
 
 	if payload.CustomerID == "" {
-		log.Warnw("integration_events: customer payload missing customer_id, dropping",
+		log.Info(context.Background(), "integration_events: customer payload missing customer_id, dropping",
 			"message_uuid", msgUUID,
 		)
 		return nil
@@ -198,7 +213,7 @@ func DispatchCustomerVendorSync(
 		return nil
 	}
 
-	log.Infow("integration_events: dispatching customer vendor sync",
+	log.Info(ctx, "integration_events: dispatching customer vendor sync",
 		"customer_id", in.CustomerID,
 		"tenant_id", in.TenantID,
 		"environment_id", in.EnvironmentID,
@@ -231,6 +246,92 @@ func DispatchCustomerVendorSync(
 	return nil
 }
 
+// DispatchSubscriptionVendorSync starts PaddleSubscriptionSyncWorkflow for every new subscription.
+func DispatchSubscriptionVendorSync(
+	ctx context.Context,
+	cfg *config.Configuration,
+	connRepo connection.Repository,
+	eimRepo entityintegrationmapping.Repository,
+	log *logger.Logger,
+	event *types.WebhookEvent,
+	msgUUID string,
+) error {
+	if cfg != nil && !cfg.IntegrationEvents.Enabled {
+		return nil
+	}
+
+	var pl struct {
+		SubscriptionID string `json:"subscription_id"`
+		CustomerID     string `json:"customer_id"`
+	}
+	if err := json.Unmarshal(event.Payload, &pl); err != nil || pl.SubscriptionID == "" {
+		log.Info(context.Background(), "integration_events: invalid subscription.created payload, skipping",
+			"message_uuid", msgUUID, "error", err)
+		return nil
+	}
+
+	temporalSvc := temporalservice.GetGlobalTemporalService()
+	if temporalSvc == nil {
+		return errTemporalUnavailable
+	}
+
+	return triggerPaddleSubscriptionSyncIfEnabled(ctx, connRepo, eimRepo, temporalSvc, log, subscriptionVendorSyncInput{
+		TenantID:       event.TenantID,
+		EnvironmentID:  event.EnvironmentID,
+		UserID:         event.UserID,
+		SubscriptionID: pl.SubscriptionID,
+		CustomerID:     pl.CustomerID,
+	})
+}
+
+type subscriptionVendorSyncInput struct {
+	TenantID       string
+	EnvironmentID  string
+	UserID         string
+	SubscriptionID string
+	CustomerID     string
+}
+
+func triggerPaddleSubscriptionSyncIfEnabled(
+	ctx context.Context,
+	connRepo connection.Repository,
+	eimRepo entityintegrationmapping.Repository,
+	temporalSvc temporalservice.TemporalService,
+	log *logger.Logger,
+	in subscriptionVendorSyncInput,
+) error {
+	conn, err := getConnectionIfExists(ctx, connRepo, types.SecretProviderPaddle)
+	if err != nil {
+		return err
+	}
+
+	if conn == nil {
+		return nil
+	}
+	if subscriptionAlreadySynced(ctx, eimRepo, in.SubscriptionID, types.SecretProviderPaddle) {
+		log.Info(ctx, "integration_events: subscription already synced to Paddle, skipping",
+			"subscription_id", in.SubscriptionID)
+		return nil
+	}
+
+	input := temporalmodels.PaddleSubscriptionSyncWorkflowInput{
+		SubscriptionID: in.SubscriptionID,
+		CustomerID:     in.CustomerID,
+		TenantID:       in.TenantID,
+		EnvironmentID:  in.EnvironmentID,
+	}
+	workflowRun, wfErr := temporalSvc.ExecuteWorkflow(ctx, types.TemporalPaddleSubscriptionSyncWorkflow, input)
+	if wfErr != nil {
+		log.Error(ctx, "integration_events: failed to start PaddleSubscriptionSyncWorkflow",
+			"subscription_id", in.SubscriptionID, "error", wfErr)
+		return fmt.Errorf("paddle subscription sync workflow start failed: %w", wfErr)
+	}
+	log.Info(ctx, "integration_events: PaddleSubscriptionSyncWorkflow started",
+		"subscription_id", in.SubscriptionID,
+		"workflow_id", workflowRun.GetID())
+	return nil
+}
+
 func executeWorkflow(
 	ctx context.Context,
 	temporalSvc temporalservice.TemporalService,
@@ -242,7 +343,7 @@ func executeWorkflow(
 ) error {
 	workflowRun, err := temporalSvc.ExecuteWorkflow(ctx, workflowType, input)
 	if err != nil {
-		log.Errorw("integration_events: failed to start workflow",
+		log.Error(ctx, "integration_events: failed to start workflow",
 			"provider", provider,
 			"workflow_type", workflowType,
 			"invoice_id", invoiceID,
@@ -251,7 +352,7 @@ func executeWorkflow(
 		return fmt.Errorf("provider %s workflow start failed: %w", provider, err)
 	}
 
-	log.Infow("integration_events: workflow started",
+	log.Info(ctx, "integration_events: workflow started",
 		"provider", provider,
 		"workflow_type", workflowType,
 		"invoice_id", invoiceID,
@@ -272,7 +373,7 @@ func executeCustomerWorkflow(
 ) error {
 	workflowRun, err := temporalSvc.ExecuteWorkflow(ctx, workflowType, input)
 	if err != nil {
-		log.Errorw("integration_events: failed to start workflow",
+		log.Error(ctx, "integration_events: failed to start workflow",
 			"provider", provider,
 			"workflow_type", workflowType,
 			"customer_id", customerID,
@@ -281,7 +382,7 @@ func executeCustomerWorkflow(
 		return fmt.Errorf("provider %s workflow start failed: %w", provider, err)
 	}
 
-	log.Infow("integration_events: workflow started",
+	log.Info(ctx, "integration_events: workflow started",
 		"provider", provider,
 		"workflow_type", workflowType,
 		"customer_id", customerID,
@@ -307,7 +408,7 @@ func triggerStripeIfEnabled(
 		return nil
 	}
 	if invoiceAlreadySynced(ctx, eimRepo, in.InvoiceID, types.SecretProviderStripe) {
-		log.Infow("integration_events: invoice already synced to Stripe, skipping", "invoice_id", in.InvoiceID)
+		log.Info(ctx, "integration_events: invoice already synced to Stripe, skipping", "invoice_id", in.InvoiceID)
 		return nil
 	}
 
@@ -335,7 +436,7 @@ func triggerRazorpayIfEnabled(
 		return nil
 	}
 	if invoiceAlreadySynced(ctx, eimRepo, in.InvoiceID, types.SecretProviderRazorpay) {
-		log.Infow("integration_events: invoice already synced to Razorpay, skipping", "invoice_id", in.InvoiceID)
+		log.Info(ctx, "integration_events: invoice already synced to Razorpay, skipping", "invoice_id", in.InvoiceID)
 		return nil
 	}
 
@@ -363,7 +464,7 @@ func triggerChargebeeIfEnabled(
 		return nil
 	}
 	if invoiceAlreadySynced(ctx, eimRepo, in.InvoiceID, types.SecretProviderChargebee) {
-		log.Infow("integration_events: invoice already synced to Chargebee, skipping", "invoice_id", in.InvoiceID)
+		log.Info(ctx, "integration_events: invoice already synced to Chargebee, skipping", "invoice_id", in.InvoiceID)
 		return nil
 	}
 
@@ -391,7 +492,7 @@ func triggerQuickBooksIfEnabled(
 		return nil
 	}
 	if invoiceAlreadySynced(ctx, eimRepo, in.InvoiceID, types.SecretProviderQuickBooks) {
-		log.Infow("integration_events: invoice already synced to QuickBooks, skipping", "invoice_id", in.InvoiceID)
+		log.Info(ctx, "integration_events: invoice already synced to QuickBooks, skipping", "invoice_id", in.InvoiceID)
 		return nil
 	}
 
@@ -419,7 +520,7 @@ func triggerHubSpotIfEnabled(
 		return nil
 	}
 	if invoiceAlreadySynced(ctx, eimRepo, in.InvoiceID, types.SecretProviderHubSpot) {
-		log.Infow("integration_events: invoice already synced to HubSpot, skipping", "invoice_id", in.InvoiceID)
+		log.Info(ctx, "integration_events: invoice already synced to HubSpot, skipping", "invoice_id", in.InvoiceID)
 		return nil
 	}
 
@@ -447,7 +548,7 @@ func triggerMoyasarIfEnabled(
 		return nil
 	}
 	if invoiceAlreadySynced(ctx, eimRepo, in.InvoiceID, types.SecretProviderMoyasar) {
-		log.Infow("integration_events: invoice already synced to Moyasar, skipping", "invoice_id", in.InvoiceID)
+		log.Info(ctx, "integration_events: invoice already synced to Moyasar, skipping", "invoice_id", in.InvoiceID)
 		return nil
 	}
 
@@ -475,7 +576,7 @@ func triggerNomodIfEnabled(
 		return nil
 	}
 	if invoiceAlreadySynced(ctx, eimRepo, in.InvoiceID, types.SecretProviderNomod) {
-		log.Infow("integration_events: invoice already synced to Nomod, skipping", "invoice_id", in.InvoiceID)
+		log.Info(ctx, "integration_events: invoice already synced to Nomod, skipping", "invoice_id", in.InvoiceID)
 		return nil
 	}
 
@@ -503,7 +604,7 @@ func triggerPaddleIfEnabled(
 		return nil
 	}
 	if invoiceAlreadySynced(ctx, eimRepo, in.InvoiceID, types.SecretProviderPaddle) {
-		log.Infow("integration_events: invoice already synced to Paddle, skipping", "invoice_id", in.InvoiceID)
+		log.Info(ctx, "integration_events: invoice already synced to Paddle, skipping", "invoice_id", in.InvoiceID)
 		return nil
 	}
 
@@ -531,7 +632,7 @@ func triggerZohoBooksIfEnabled(
 		return nil
 	}
 	if invoiceAlreadySynced(ctx, eimRepo, in.InvoiceID, types.SecretProviderZohoBooks) {
-		log.Infow("integration_events: invoice already synced to Zoho Books, skipping", "invoice_id", in.InvoiceID)
+		log.Info(ctx, "integration_events: invoice already synced to Zoho Books, skipping", "invoice_id", in.InvoiceID)
 		return nil
 	}
 	input := &temporalmodels.ZohoBooksInvoiceSyncWorkflowInput{
@@ -558,7 +659,7 @@ func triggerStripeCustomerSyncIfEnabled(
 		return nil
 	}
 	if customerAlreadySynced(ctx, eimRepo, in.CustomerID, types.SecretProviderStripe) {
-		log.Infow("integration_events: customer already synced to Stripe, skipping", "customer_id", in.CustomerID)
+		log.Info(ctx, "integration_events: customer already synced to Stripe, skipping", "customer_id", in.CustomerID)
 		return nil
 	}
 	input := &temporalmodels.StripeCustomerSyncWorkflowInput{
@@ -585,7 +686,7 @@ func triggerRazorpayCustomerSyncIfEnabled(
 		return nil
 	}
 	if customerAlreadySynced(ctx, eimRepo, in.CustomerID, types.SecretProviderRazorpay) {
-		log.Infow("integration_events: customer already synced to Razorpay, skipping", "customer_id", in.CustomerID)
+		log.Info(ctx, "integration_events: customer already synced to Razorpay, skipping", "customer_id", in.CustomerID)
 		return nil
 	}
 	input := &temporalmodels.RazorpayCustomerSyncWorkflowInput{
@@ -612,7 +713,7 @@ func triggerChargebeeCustomerSyncIfEnabled(
 		return nil
 	}
 	if customerAlreadySynced(ctx, eimRepo, in.CustomerID, types.SecretProviderChargebee) {
-		log.Infow("integration_events: customer already synced to Chargebee, skipping", "customer_id", in.CustomerID)
+		log.Info(ctx, "integration_events: customer already synced to Chargebee, skipping", "customer_id", in.CustomerID)
 		return nil
 	}
 	input := &temporalmodels.ChargebeeCustomerSyncWorkflowInput{
@@ -639,7 +740,7 @@ func triggerQuickBooksCustomerSyncIfEnabled(
 		return nil
 	}
 	if customerAlreadySynced(ctx, eimRepo, in.CustomerID, types.SecretProviderQuickBooks) {
-		log.Infow("integration_events: customer already synced to QuickBooks, skipping", "customer_id", in.CustomerID)
+		log.Info(ctx, "integration_events: customer already synced to QuickBooks, skipping", "customer_id", in.CustomerID)
 		return nil
 	}
 	input := &temporalmodels.QuickBooksCustomerSyncWorkflowInput{
@@ -666,7 +767,7 @@ func triggerNomodCustomerSyncIfEnabled(
 		return nil
 	}
 	if customerAlreadySynced(ctx, eimRepo, in.CustomerID, types.SecretProviderNomod) {
-		log.Infow("integration_events: customer already synced to Nomod, skipping", "customer_id", in.CustomerID)
+		log.Info(ctx, "integration_events: customer already synced to Nomod, skipping", "customer_id", in.CustomerID)
 		return nil
 	}
 	input := &temporalmodels.NomodCustomerSyncWorkflowInput{
@@ -693,7 +794,7 @@ func triggerPaddleCustomerSyncIfEnabled(
 		return nil
 	}
 	if customerAlreadySynced(ctx, eimRepo, in.CustomerID, types.SecretProviderPaddle) {
-		log.Infow("integration_events: customer already synced to Paddle, skipping", "customer_id", in.CustomerID)
+		log.Info(ctx, "integration_events: customer already synced to Paddle, skipping", "customer_id", in.CustomerID)
 		return nil
 	}
 	input := &temporalmodels.PaddleCustomerSyncWorkflowInput{
@@ -702,6 +803,107 @@ func triggerPaddleCustomerSyncIfEnabled(
 		EnvironmentID: in.EnvironmentID,
 	}
 	return executeCustomerWorkflow(ctx, temporalSvc, log, types.TemporalPaddleCustomerSyncWorkflow, input, types.SecretProviderPaddle, in.CustomerID)
+}
+
+// DispatchInvoicePaidVendorSync starts provider-specific workflows to push the
+// "invoice paid" status back to the external vendor. Currently only Whop needs this.
+func DispatchInvoicePaidVendorSync(
+	ctx context.Context,
+	cfg *config.Configuration,
+	connRepo connection.Repository,
+	eimRepo entityintegrationmapping.Repository,
+	log *logger.Logger,
+	event *types.WebhookEvent,
+	msgUUID string,
+) error {
+	if cfg != nil && !cfg.IntegrationEvents.Enabled {
+		return nil
+	}
+
+	var pl struct {
+		InvoiceID string `json:"invoice_id"`
+	}
+	if err := json.Unmarshal(event.Payload, &pl); err != nil || pl.InvoiceID == "" {
+		log.Error(ctx, "integration_events: invalid invoice payment payload, dropping",
+			"message_uuid", msgUUID,
+			"error", err,
+		)
+		return nil
+	}
+
+	in := invoiceVendorSyncInput{
+		TenantID:      event.TenantID,
+		EnvironmentID: event.EnvironmentID,
+		UserID:        event.UserID,
+		InvoiceID:     pl.InvoiceID,
+	}
+
+	temporalSvc := temporalservice.GetGlobalTemporalService()
+	if temporalSvc == nil {
+		return errTemporalUnavailable
+	}
+
+	log.Info(ctx, "integration_events: dispatching invoice paid vendor sync",
+		"invoice_id", in.InvoiceID,
+		"tenant_id", in.TenantID,
+		"environment_id", in.EnvironmentID,
+	)
+
+	if err := triggerWhopMarkPaidIfEnabled(ctx, connRepo, temporalSvc, log, in); err != nil {
+		return fmt.Errorf("integration_events: whop mark-paid dispatch failed for invoice %s: %w", in.InvoiceID, err)
+	}
+	return nil
+}
+
+func triggerWhopMarkPaidIfEnabled(
+	ctx context.Context,
+	connRepo connection.Repository,
+	temporalSvc temporalservice.TemporalService,
+	log *logger.Logger,
+	in invoiceVendorSyncInput,
+) error {
+	conn, err := getConnectionIfExists(ctx, connRepo, types.SecretProviderWhop)
+	if err != nil {
+		return err
+	}
+	if conn == nil || !conn.IsInvoiceOutboundEnabled() {
+		return nil
+	}
+
+	input := &temporalmodels.WhopInvoiceMarkPaidWorkflowInput{
+		InvoiceID:     in.InvoiceID,
+		TenantID:      in.TenantID,
+		EnvironmentID: in.EnvironmentID,
+	}
+	return executeWorkflow(ctx, temporalSvc, log, types.TemporalWhopInvoiceMarkPaidWorkflow, input, types.SecretProviderWhop, in.InvoiceID)
+}
+
+func triggerWhopIfEnabled(
+	ctx context.Context,
+	connRepo connection.Repository,
+	eimRepo entityintegrationmapping.Repository,
+	temporalSvc temporalservice.TemporalService,
+	log *logger.Logger,
+	in invoiceVendorSyncInput,
+) error {
+	conn, err := getConnectionIfExists(ctx, connRepo, types.SecretProviderWhop)
+	if err != nil {
+		return err
+	}
+	if conn == nil || !conn.IsInvoiceOutboundEnabled() {
+		return nil
+	}
+	if invoiceAlreadySynced(ctx, eimRepo, in.InvoiceID, types.SecretProviderWhop) {
+		log.Info(ctx, "integration_events: invoice already synced to Whop, skipping", "invoice_id", in.InvoiceID)
+		return nil
+	}
+
+	input := &temporalmodels.WhopInvoiceSyncWorkflowInput{
+		InvoiceID:     in.InvoiceID,
+		TenantID:      in.TenantID,
+		EnvironmentID: in.EnvironmentID,
+	}
+	return executeWorkflow(ctx, temporalSvc, log, types.TemporalWhopInvoiceSyncWorkflow, input, types.SecretProviderWhop, in.InvoiceID)
 }
 
 var errTemporalUnavailable = fmt.Errorf("integration_events: temporal service not available")

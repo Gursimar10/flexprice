@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/flexprice/flexprice/internal/domain/coupon"
@@ -48,7 +49,7 @@ func (s *couponValidationService) ValidateCoupon(ctx context.Context, coupon cou
 		subscriptionID = &subscription.ID
 	}
 
-	s.Logger.InfowCtx(ctx, "validating coupon for subscription association",
+	s.Logger.Info(ctx, "validating coupon for subscription association",
 		"coupon_id", coupon.ID,
 		"subscription_id", subscriptionID)
 
@@ -74,7 +75,7 @@ func (s *couponValidationService) ValidateCoupon(ctx context.Context, coupon cou
 		}
 	}
 
-	s.Logger.InfowCtx(ctx, "coupon validation for subscription successful",
+	s.Logger.Info(ctx, "coupon validation for subscription successful",
 		"coupon_id", coupon.ID,
 		"subscription_id", subscriptionID)
 
@@ -155,9 +156,13 @@ func (s *couponValidationService) validateCouponDateRange(coupon coupon.Coupon) 
 
 // Currency validation
 func (s *couponValidationService) validateCouponCurrency(coupon coupon.Coupon, targetCurrency string) error {
+	// Percentage coupons are currency-agnostic; skip currency check
+	if coupon.Type == types.CouponTypePercentage {
+		return nil
+	}
 	// If coupon has specific currency, it must match target currency
 	if coupon.Currency != "" {
-		if coupon.Currency != targetCurrency {
+		if !strings.EqualFold(coupon.Currency, targetCurrency) {
 			return &CouponValidationError{
 				Code:    types.CouponValidationErrorCodeCurrencyMismatch,
 				Message: "Coupon currency does not match target currency",
@@ -195,7 +200,7 @@ func (s *couponValidationService) validateCouponRedemption(coupon coupon.Coupon)
 
 // validateCouponForInvoiceSpecific implements cadence-specific validation for invoice application
 func (s *couponValidationService) validateCouponCadence(ctx context.Context, coupon coupon.Coupon, subscription *subscription.Subscription) error {
-	s.Logger.DebugwCtx(ctx, "validating coupon cadence for invoice",
+	s.Logger.Debug(ctx, "validating coupon cadence for invoice",
 		"coupon_id", coupon.ID,
 		"cadence", coupon.Cadence)
 
@@ -221,7 +226,7 @@ func (s *couponValidationService) validateCouponCadence(ctx context.Context, cou
 
 // validateOnceCadenceForInvoice validates "once" cadence - coupon should only be applied to first invoice
 func (s *couponValidationService) validateOnceCadence(ctx context.Context, coupon coupon.Coupon, subscription *subscription.Subscription) error {
-	s.Logger.DebugwCtx(ctx, "validating once cadence for invoice",
+	s.Logger.Debug(ctx, "validating once cadence for invoice",
 		"coupon_id", coupon.ID,
 		"subscription_id", subscription.ID)
 
@@ -243,7 +248,7 @@ func (s *couponValidationService) validateOnceCadence(ctx context.Context, coupo
 		}
 	}
 
-	s.Logger.DebugwCtx(ctx, "existing applications count for once cadence validation",
+	s.Logger.Debug(ctx, "existing applications count for once cadence validation",
 		"coupon_id", coupon.ID,
 		"subscription_id", subscription.ID,
 		"existing_applications", existingApplicationCount)
@@ -261,7 +266,7 @@ func (s *couponValidationService) validateOnceCadence(ctx context.Context, coupo
 		}
 	}
 
-	s.Logger.DebugwCtx(ctx, "once cadence validation passed - no previous applications found",
+	s.Logger.Debug(ctx, "once cadence validation passed - no previous applications found",
 		"coupon_id", coupon.ID,
 		"subscription_id", subscription.ID)
 
@@ -270,7 +275,7 @@ func (s *couponValidationService) validateOnceCadence(ctx context.Context, coupo
 
 // validateForeverCadence validates "forever" cadence - coupon is always applied
 func (s *couponValidationService) validateForeverCadence(coupon coupon.Coupon, subscription *subscription.Subscription) error {
-	s.Logger.Debugw("validating forever cadence for invoice",
+	s.Logger.Debug(context.Background(), "validating forever cadence for invoice",
 		"coupon_id", coupon.ID,
 		"subscription_id", subscription.ID)
 	// Forever cadence coupons are always valid for application
@@ -283,7 +288,7 @@ func (s *couponValidationService) validateForeverCadence(coupon coupon.Coupon, s
 
 // validateRepeatedCadenceForInvoice validates "repeated" cadence - coupon applied for duration_in_periods times
 func (s *couponValidationService) validateRepeatedCadence(ctx context.Context, coupon coupon.Coupon, subscription *subscription.Subscription) error {
-	s.Logger.DebugwCtx(ctx, "validating repeated cadence for invoice",
+	s.Logger.Debug(ctx, "validating repeated cadence for invoice",
 		"coupon_id", coupon.ID,
 		"duration_in_periods", coupon.DurationInPeriods)
 
@@ -306,7 +311,7 @@ func (s *couponValidationService) validateRepeatedCadence(ctx context.Context, c
 	filter.CouponIDs = []string{coupon.ID}
 	existingApplicationCount, err := s.CouponApplicationRepo.Count(ctx, filter)
 	if err != nil {
-		s.Logger.WarnwCtx(ctx, "failed to count existing applications for repeated cadence validation",
+		s.Logger.Info(ctx, "failed to count existing applications for repeated cadence validation",
 			"coupon_id", coupon.ID,
 			"subscription_id", subscription.ID,
 			"error", err)
@@ -314,7 +319,7 @@ func (s *couponValidationService) validateRepeatedCadence(ctx context.Context, c
 		return nil
 	}
 
-	s.Logger.DebugwCtx(ctx, "existing applications count for repeated cadence validation",
+	s.Logger.Debug(ctx, "existing applications count for repeated cadence validation",
 		"coupon_id", coupon.ID,
 		"subscription_id", subscription.ID,
 		"existing_applications", existingApplicationCount)
@@ -333,7 +338,7 @@ func (s *couponValidationService) validateRepeatedCadence(ctx context.Context, c
 		}
 	}
 
-	s.Logger.DebugwCtx(ctx, "repeated cadence validation passed",
+	s.Logger.Debug(ctx, "repeated cadence validation passed",
 		"coupon_id", coupon.ID,
 		"existing_applications", existingApplicationCount,
 		"duration_in_periods", *coupon.DurationInPeriods)

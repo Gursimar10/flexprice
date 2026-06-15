@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"strings"
+
 	"github.com/flexprice/flexprice/ent"
 	"github.com/flexprice/flexprice/ent/invoicelineitem"
 	"github.com/flexprice/flexprice/ent/predicate"
@@ -16,7 +18,6 @@ import (
 	"github.com/flexprice/flexprice/internal/postgres"
 	"github.com/flexprice/flexprice/internal/types"
 	"github.com/shopspring/decimal"
-	"strings"
 )
 
 const invoiceLineItemBatchSize = 1000
@@ -88,7 +89,7 @@ func (r *invoiceLineItemRepository) Create(ctx context.Context, item *domaininvo
 	})
 	defer FinishSpan(span)
 
-	r.log.Debugw("creating invoice line item",
+	r.log.Debug(ctx, "creating invoice line item",
 		"line_item_id", item.ID,
 		"invoice_id", item.InvoiceID,
 	)
@@ -122,6 +123,8 @@ func (r *invoiceLineItemRepository) Create(ctx context.Context, item *domaininvo
 		SetMetadata(item.Metadata).
 		SetEnvironmentID(item.EnvironmentID).
 		SetCommitmentInfo(item.CommitmentInfo).
+		SetNillableSubscriptionLineItemID(item.SubscriptionLineItemID).
+		SetNillableAdjustedEntitlementQuantity(item.AdjustedEntitlementQuantity).
 		SetPrepaidCreditsApplied(item.PrepaidCreditsApplied).
 		SetLineItemDiscount(item.LineItemDiscount).
 		SetInvoiceLevelDiscount(item.InvoiceLevelDiscount).
@@ -167,7 +170,7 @@ func (r *invoiceLineItemRepository) CreateBulk(ctx context.Context, items []*dom
 	})
 	defer FinishSpan(span)
 
-	r.log.Debugw("creating invoice line items in bulk",
+	r.log.Debug(ctx, "creating invoice line items in bulk",
 		"item_count", len(items),
 		"tenant_id", types.GetTenantID(ctx),
 	)
@@ -206,6 +209,8 @@ func (r *invoiceLineItemRepository) CreateBulk(ctx context.Context, items []*dom
 				SetMetadata(item.Metadata).
 				SetEnvironmentID(item.EnvironmentID).
 				SetCommitmentInfo(item.CommitmentInfo).
+				SetNillableSubscriptionLineItemID(item.SubscriptionLineItemID).
+				SetNillableAdjustedEntitlementQuantity(item.AdjustedEntitlementQuantity).
 				SetPrepaidCreditsApplied(item.PrepaidCreditsApplied).
 				SetLineItemDiscount(item.LineItemDiscount).
 				SetInvoiceLevelDiscount(item.InvoiceLevelDiscount).
@@ -257,7 +262,7 @@ func (r *invoiceLineItemRepository) Get(ctx context.Context, id string) (*domain
 		return cached, nil
 	}
 
-	r.log.Debugw("getting invoice line item",
+	r.log.Debug(ctx, "getting invoice line item",
 		"line_item_id", id,
 		"tenant_id", types.GetTenantID(ctx),
 	)
@@ -301,21 +306,31 @@ func (r *invoiceLineItemRepository) Update(ctx context.Context, item *domaininvo
 	})
 	defer FinishSpan(span)
 
-	r.log.Debugw("updating invoice line item", "line_item_id", item.ID)
+	r.log.Debug(ctx, "updating invoice line item", "line_item_id", item.ID)
 
-	_, err := r.client.Writer(ctx).InvoiceLineItem.UpdateOneID(item.ID).
+	q := r.client.Writer(ctx).InvoiceLineItem.UpdateOneID(item.ID).
 		Where(
 			invoicelineitem.TenantID(types.GetTenantID(ctx)),
 			invoicelineitem.EnvironmentID(types.GetEnvironmentID(ctx)),
 		).
+		SetAmount(item.Amount).
+		SetQuantity(item.Quantity).
 		SetPrepaidCreditsApplied(item.PrepaidCreditsApplied).
 		SetLineItemDiscount(item.LineItemDiscount).
 		SetInvoiceLevelDiscount(item.InvoiceLevelDiscount).
 		SetMetadata(item.Metadata).
+		SetCommitmentInfo(item.CommitmentInfo).
 		SetStatus(string(item.Status)).
 		SetUpdatedAt(time.Now().UTC()).
-		SetUpdatedBy(types.GetUserID(ctx)).
-		Save(ctx)
+		SetUpdatedBy(types.GetUserID(ctx))
+
+	if item.AdjustedEntitlementQuantity != nil {
+		q = q.SetAdjustedEntitlementQuantity(*item.AdjustedEntitlementQuantity)
+	} else {
+		q = q.ClearAdjustedEntitlementQuantity()
+	}
+
+	_, err := q.Save(ctx)
 
 	if err != nil {
 		SetSpanError(span, err)
@@ -348,7 +363,7 @@ func (r *invoiceLineItemRepository) Delete(ctx context.Context, id string) error
 	})
 	defer FinishSpan(span)
 
-	r.log.Debugw("deleting invoice line item",
+	r.log.Debug(ctx, "deleting invoice line item",
 		"line_item_id", id,
 		"tenant_id", types.GetTenantID(ctx),
 	)
@@ -393,7 +408,7 @@ func (r *invoiceLineItemRepository) ListByInvoiceID(ctx context.Context, invoice
 	})
 	defer FinishSpan(span)
 
-	r.log.Debugw("listing invoice line items by invoice",
+	r.log.Debug(ctx, "listing invoice line items by invoice",
 		"invoice_id", invoiceID,
 		"tenant_id", types.GetTenantID(ctx),
 	)
@@ -619,6 +634,7 @@ func (r *invoiceLineItemRepository) GetRevenueByCustomer(
 		SELECT
 			ili.customer_id,
 			ili.price_type,
+			ili.currency,
 			COALESCE(SUM(ili.amount), 0)::text AS amount
 		FROM invoice_line_items ili
 		INNER JOIN invoices inv
@@ -631,7 +647,7 @@ func (r *invoiceLineItemRepository) GetRevenueByCustomer(
 			AND ili.tenant_id = $1
 			AND ili.environment_id = $2
 			%s
-		GROUP BY ili.customer_id, ili.price_type
+		GROUP BY ili.customer_id, ili.price_type, ili.currency
 	`, customerFilter)
 
 	rows, err := r.client.Reader(ctx).QueryContext(ctx, query, args...)
@@ -647,7 +663,7 @@ func (r *invoiceLineItemRepository) GetRevenueByCustomer(
 	for rows.Next() {
 		var row domaininvoice.RevenueByCustomerRow
 		var amountStr string
-		if err := rows.Scan(&row.CustomerID, &row.PriceType, &amountStr); err != nil {
+		if err := rows.Scan(&row.CustomerID, &row.PriceType, &row.Currency, &amountStr); err != nil {
 			SetSpanError(span, err)
 			return nil, ierr.WithError(err).
 				WithHint("failed to scan revenue row").

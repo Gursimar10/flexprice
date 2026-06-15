@@ -157,6 +157,9 @@ func (Invoice) Fields() []ent.Field {
 		field.Time("finalized_at").
 			Optional().
 			Nillable(),
+		field.Time("issue_date").
+			Optional().
+			Nillable(),
 		field.Time("last_computed_at").
 			Optional().
 			Nillable(),
@@ -256,7 +259,7 @@ func (Invoice) Indexes() []ent.Index {
 		index.Fields("tenant_id", "environment_id", "idempotency_key").
 			Unique().
 			StorageKey(Idx_tenant_environment_idempotency_key_unique).
-			Annotations(entsql.IndexWhere("idempotency_key IS NOT NULL")),
+			Annotations(entsql.IndexWhere("((idempotency_key IS NOT NULL) AND ((status)::text = 'published'::text) AND ((invoice_status)::text <> 'VOIDED'::text))")),
 		index.Fields("subscription_id", "period_start", "period_end").
 			StorageKey("idx_subscription_period_unique").
 			Annotations(entsql.IndexWhere("invoice_status != 'VOIDED' AND subscription_id IS NOT NULL")),

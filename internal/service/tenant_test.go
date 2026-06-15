@@ -6,6 +6,7 @@ import (
 	"github.com/flexprice/flexprice/internal/api/dto"
 	"github.com/flexprice/flexprice/internal/domain/tenant"
 	"github.com/flexprice/flexprice/internal/testutil"
+	"github.com/flexprice/flexprice/internal/types"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -57,8 +58,17 @@ func (s *TenantServiceSuite) setupService() {
 	})
 }
 
+const (
+	accessTestTargetTenantID   = "tenant-target"
+	accessTestOperatorTenantID = "tenant-operator"
+)
+
 func (s *TenantServiceSuite) setupTestData() {
-	// Clear any existing data
+	_ = s.tenantRepo.Create(s.GetContext(), &tenant.Tenant{
+		ID:             accessTestTargetTenantID,
+		Name:           "Target Tenant",
+		InternalStatus: types.TenantInternalStatusTrialing,
+	})
 }
 
 func (s *TenantServiceSuite) TestCreateTenant() {
@@ -75,6 +85,17 @@ func (s *TenantServiceSuite) TestCreateTenant() {
 			},
 			expectedError: false,
 			expectedName:  "New Tenant",
+		},
+		{
+			name: "valid_tenant_with_metadata",
+			request: dto.CreateTenantRequest{
+				Name: "Metadata Tenant",
+				Metadata: map[string]string{
+					"signup_source": "partner_portal",
+				},
+			},
+			expectedError: false,
+			expectedName:  "Metadata Tenant",
 		},
 		{
 			name: "invalid_tenant",
@@ -98,6 +119,13 @@ func (s *TenantServiceSuite) TestCreateTenant() {
 				s.NoError(err)
 				s.NotNil(resp)
 				s.Equal(tc.expectedName, resp.Name)
+
+				if tc.request.Metadata != nil {
+					createdTenant, err := s.tenantRepo.GetByID(s.GetContext(), resp.ID)
+					s.NoError(err)
+					s.Equal(tc.request.Metadata, map[string]string(createdTenant.Metadata))
+					s.Equal(tc.request.Metadata, map[string]string(*resp.Metadata))
+				}
 			}
 		})
 	}

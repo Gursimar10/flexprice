@@ -5,6 +5,7 @@ import (
 
 	"github.com/flexprice/flexprice/internal/api/dto"
 	"github.com/flexprice/flexprice/internal/cache"
+	"github.com/flexprice/flexprice/internal/config"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/service"
@@ -20,6 +21,7 @@ type PlanHandler struct {
 	entitlementService service.EntitlementService
 	creditGrantService service.CreditGrantService
 	temporalService    temporalservice.TemporalService
+	cfg                *config.Configuration
 	log                *logger.Logger
 }
 
@@ -28,6 +30,7 @@ func NewPlanHandler(
 	entitlementService service.EntitlementService,
 	creditGrantService service.CreditGrantService,
 	temporalService temporalservice.TemporalService,
+	cfg *config.Configuration,
 	log *logger.Logger,
 ) *PlanHandler {
 	return &PlanHandler{
@@ -35,6 +38,7 @@ func NewPlanHandler(
 		entitlementService: entitlementService,
 		creditGrantService: creditGrantService,
 		temporalService:    temporalService,
+		cfg:                cfg,
 		log:                log,
 	}
 }
@@ -297,20 +301,21 @@ func (h *PlanHandler) SyncPlanPrices(c *gin.Context) {
 	lockKey := priceSyncLockKey(id)
 	acquired, err := redisCache.TrySetNX(c.Request.Context(), lockKey, "1", cache.ExpiryPriceSyncLock)
 	if err != nil {
-		h.log.Errorw("price_sync_lock_acquire_failed", "plan_id", id, "lock_key", lockKey, "error", err)
+		h.log.Error(c.Request.Context(), "price_sync_lock_acquire_failed", "plan_id", id, "lock_key", lockKey, "error", err)
 		c.Error(ierr.NewError("failed to acquire price sync lock").
 			WithHint("Try again later.").
 			Mark(ierr.ErrInternal))
 		return
 	}
 	if !acquired {
-		h.log.Infow("price_sync_lock_rejected", "plan_id", id, "lock_key", lockKey, "reason", "already_held")
+		h.log.Info(c.Request.Context(), "price_sync_lock_rejected", "plan_id", id, "lock_key", lockKey, "reason", "already_held")
 		c.Error(ierr.NewError("price sync already in progress for this plan").
 			WithHint("Try again later or wait up to 2 hours for the current sync to complete.").
 			Mark(ierr.ErrAlreadyExists))
 		return
 	}
-	h.log.Infow("price_sync_lock_acquired", "plan_id", id, "lock_key", lockKey)
+	h.log.Info(c.Request.Context(), "price_sync_lock_acquired", "plan_id", id, "lock_key", lockKey)
+
 	// Start the price sync workflow (activity will release lock when done)
 	workflowRun, err := h.temporalService.ExecuteWorkflow(c.Request.Context(), types.TemporalPriceSyncWorkflow, id)
 	if err != nil {
@@ -407,6 +412,14 @@ func (h *PlanHandler) SyncPlanPricesV2(c *gin.Context) {
 			Mark(ierr.ErrValidation))
 		return
 	}
+
+	// Verify that the plan exists
+	_, err := h.service.GetPlan(c.Request.Context(), id)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+
 	// Acquire plan-level lock (Redis SetNX, 2h TTL)
 	redisCache := cache.GetRedisCache()
 	if redisCache == nil {
@@ -418,27 +431,31 @@ func (h *PlanHandler) SyncPlanPricesV2(c *gin.Context) {
 	lockKey := priceSyncLockKey(id)
 	acquired, err := redisCache.TrySetNX(c.Request.Context(), lockKey, "1", cache.ExpiryPriceSyncLock)
 	if err != nil {
-		h.log.Errorw("price_sync_lock_acquire_failed", "plan_id", id, "lock_key", lockKey, "error", err)
+		h.log.Error(c.Request.Context(), "price_sync_lock_acquire_failed", "plan_id", id, "lock_key", lockKey, "error", err)
 		c.Error(ierr.NewError("failed to acquire price sync lock").
 			WithHint("Try again later.").
 			Mark(ierr.ErrInternal))
 		return
 	}
 	if !acquired {
-		h.log.Infow("price_sync_lock_rejected", "plan_id", id, "lock_key", lockKey, "reason", "already_held")
+		h.log.Info(c.Request.Context(), "price_sync_lock_rejected", "plan_id", id, "lock_key", lockKey, "reason", "already_held")
 		c.Error(ierr.NewError("price sync already in progress for this plan").
 			WithHint("Try again later or wait up to 2 hours for the current sync to complete.").
 			Mark(ierr.ErrAlreadyExists))
 		return
 	}
-	h.log.Infow("price_sync_lock_acquired", "plan_id", id, "lock_key", lockKey)
-	defer redisCache.Delete(c.Request.Context(), lockKey)
+	h.log.Info(c.Request.Context(), "price_sync_lock_acquired", "plan_id", id, "lock_key", lockKey)
 
-	resp, err := h.service.SyncPlanPrices(c.Request.Context(), id)
+	// Start the price sync workflow (activity will release lock when done)
+	workflowRun, err := h.temporalService.ExecuteWorkflow(c.Request.Context(), types.TemporalPriceSyncV2Workflow, id)
 	if err != nil {
 		c.Error(err)
 		return
 	}
 
-	c.JSON(http.StatusOK, resp)
+	c.JSON(http.StatusOK, models.TemporalWorkflowResult{
+		Message:    "price sync v2 workflow started",
+		WorkflowID: workflowRun.GetID(),
+		RunID:      workflowRun.GetRunID(),
+	})
 }

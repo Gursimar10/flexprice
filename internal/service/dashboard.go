@@ -47,7 +47,7 @@ func (s *dashboardService) GetRevenues(ctx context.Context, req dto.DashboardRev
 	if req.RevenueTrend != nil {
 		revenueTrend, err := s.getRevenueTrend(ctx, req.RevenueTrend)
 		if err != nil {
-			s.Logger.ErrorwCtx(ctx, "failed to get revenue trend", "error", err)
+			s.Logger.Error(ctx, "failed to get revenue trend", "error", err)
 			// Continue with other sections even if this fails
 		} else {
 			response.RevenueTrend = revenueTrend
@@ -57,7 +57,7 @@ func (s *dashboardService) GetRevenues(ctx context.Context, req dto.DashboardRev
 	// Recent Subscriptions - always fetch
 	recentSubs, err := s.getRecentSubscriptions(ctx)
 	if err != nil {
-		s.Logger.ErrorwCtx(ctx, "failed to get recent subscriptions", "error", err)
+		s.Logger.Error(ctx, "failed to get recent subscriptions", "error", err)
 		// Continue with other sections even if this fails
 	} else {
 		response.RecentSubscriptions = recentSubs
@@ -66,7 +66,7 @@ func (s *dashboardService) GetRevenues(ctx context.Context, req dto.DashboardRev
 	// Invoice Payment Status - always fetch
 	paymentStatus, err := s.getInvoicePaymentStatus(ctx)
 	if err != nil {
-		s.Logger.ErrorwCtx(ctx, "failed to get invoice payment status", "error", err)
+		s.Logger.Error(ctx, "failed to get invoice payment status", "error", err)
 		// Continue with other sections even if this fails
 	} else {
 		response.InvoicePaymentStatus = paymentStatus
@@ -197,19 +197,24 @@ func (s *dashboardService) GetRevenueDashboard(ctx context.Context, req dto.Reve
 		}
 	}
 
-	// Step 3: Aggregate per-customer data
+	// Step 3: Aggregate per (customer, currency)
+	type customerKey struct {
+		customerID string
+		currency   string
+	}
 	type customerData struct {
 		usageRevenue decimal.Decimal
 		fixedRevenue decimal.Decimal
 		voiceMs      decimal.Decimal
 	}
-	customerMap := make(map[string]*customerData)
+	customerMap := make(map[customerKey]*customerData)
 
 	for _, row := range revenueRows {
-		cd, ok := customerMap[row.CustomerID]
+		key := customerKey{row.CustomerID, strings.ToLower(row.Currency)}
+		cd, ok := customerMap[key]
 		if !ok {
 			cd = &customerData{}
-			customerMap[row.CustomerID] = cd
+			customerMap[key] = cd
 		}
 		if row.PriceType == string(types.PRICE_TYPE_USAGE) {
 			cd.usageRevenue = cd.usageRevenue.Add(row.Amount)
@@ -218,22 +223,25 @@ func (s *dashboardService) GetRevenueDashboard(ctx context.Context, req dto.Reve
 		}
 	}
 
-	// Merge voice minutes
+	// Merge voice minutes (voice has no currency; attach the customer's total to every (customer, currency) entry)
 	if hasCustomAnalytics {
+		voiceByCustomer := make(map[string]decimal.Decimal)
 		for _, row := range voiceRows {
-			cd, ok := customerMap[row.CustomerID]
-			if !ok {
-				cd = &customerData{}
-				customerMap[row.CustomerID] = cd
-			}
-			cd.voiceMs = cd.voiceMs.Add(row.UsageMs)
+			voiceByCustomer[row.CustomerID] = voiceByCustomer[row.CustomerID].Add(row.UsageMs)
+		}
+		for key, cd := range customerMap {
+			cd.voiceMs = voiceByCustomer[key.customerID]
 		}
 	}
 
 	// Step 4: Bulk-fetch customer details for enrichment
 	uniqueCustomerIDs := make([]string, 0, len(customerMap))
-	for custID := range customerMap {
-		uniqueCustomerIDs = append(uniqueCustomerIDs, custID)
+	seen := make(map[string]bool)
+	for key := range customerMap {
+		if !seen[key.customerID] {
+			seen[key.customerID] = true
+			uniqueCustomerIDs = append(uniqueCustomerIDs, key.customerID)
+		}
 	}
 
 	type customerInfo struct {
@@ -249,7 +257,7 @@ func (s *dashboardService) GetRevenueDashboard(ctx context.Context, req dto.Reve
 		}
 		customers, err := s.CustomerRepo.List(ctx, custFilter)
 		if err != nil {
-			s.Logger.WarnwCtx(ctx, "failed to fetch customer details for revenue dashboard", "error", err)
+			s.Logger.Info(ctx, "failed to fetch customer details for revenue dashboard", "error", err)
 			// Continue without customer details rather than failing the entire request
 		} else {
 			for _, c := range customers {
@@ -265,25 +273,28 @@ func (s *dashboardService) GetRevenueDashboard(ctx context.Context, req dto.Reve
 	msPerMinute := decimal.NewFromInt(60000)
 
 	var items []dto.RevenueDashboardCustomer
-	summaryUsage := decimal.Zero
-	summaryFixed := decimal.Zero
-	summaryVoiceMs := decimal.Zero
+	summaries := make(map[string]dto.RevenueDashboardSummary)
+	summaryVoiceMsByCur := make(map[string]decimal.Decimal)
 
-	for custID, cd := range customerMap {
+	for key, cd := range customerMap {
 		totalRevenue := cd.usageRevenue.Add(cd.fixedRevenue)
 		if totalRevenue.IsZero() {
 			continue
 		}
 
-		summaryUsage = summaryUsage.Add(cd.usageRevenue)
-		summaryFixed = summaryFixed.Add(cd.fixedRevenue)
-		summaryVoiceMs = summaryVoiceMs.Add(cd.voiceMs)
+		sum := summaries[key.currency]
+		sum.TotalRevenue = sum.TotalRevenue.Add(totalRevenue)
+		sum.TotalUsageRevenue = sum.TotalUsageRevenue.Add(cd.usageRevenue)
+		sum.TotalFixedRevenue = sum.TotalFixedRevenue.Add(cd.fixedRevenue)
+		summaries[key.currency] = sum
+		summaryVoiceMsByCur[key.currency] = summaryVoiceMsByCur[key.currency].Add(cd.voiceMs)
 
-		info := customerInfoMap[custID]
+		info := customerInfoMap[key.customerID]
 		cust := dto.RevenueDashboardCustomer{
-			CustomerID:         custID,
+			CustomerID:         key.customerID,
 			CustomerName:       info.Name,
 			ExternalCustomerID: info.ExternalID,
+			Currency:           key.currency,
 			TotalRevenue:       totalRevenue,
 			TotalUsageRevenue:  cd.usageRevenue,
 			TotalFixedRevenue:  cd.fixedRevenue,
@@ -302,21 +313,17 @@ func (s *dashboardService) GetRevenueDashboard(ctx context.Context, req dto.Reve
 		items = append(items, cust)
 	}
 
-	// Build summary
-	summaryTotal := summaryUsage.Add(summaryFixed)
-	summary := dto.RevenueDashboardSummary{
-		TotalRevenue:      summaryTotal,
-		TotalUsageRevenue: summaryUsage,
-		TotalFixedRevenue: summaryFixed,
-	}
-
+	// Build per-currency summary voice/CPM
 	if hasCustomAnalytics {
-		voiceMinutes := summaryVoiceMs.Div(msPerMinute)
-		summary.VoiceMinutes = &voiceMinutes
-
-		if !summaryVoiceMs.IsZero() {
-			cpm := summaryUsage.Div(voiceMinutes)
-			summary.CPM = &cpm
+		for cur, voiceMsTotal := range summaryVoiceMsByCur {
+			sum := summaries[cur]
+			voiceMinutes := voiceMsTotal.Div(msPerMinute)
+			sum.VoiceMinutes = &voiceMinutes
+			if !voiceMsTotal.IsZero() {
+				cpm := sum.TotalUsageRevenue.Div(voiceMinutes)
+				sum.CPM = &cpm
+			}
+			summaries[cur] = sum
 		}
 	}
 
@@ -355,9 +362,9 @@ func (s *dashboardService) GetRevenueDashboard(ctx context.Context, req dto.Reve
 	}
 
 	return &dto.RevenueDashboardResponse{
-		Summary: summary,
-		Items:   items,
-		Graph:   graph,
+		Summaries: summaries,
+		Items:     items,
+		Graph:     graph,
 	}, nil
 }
 
@@ -423,7 +430,7 @@ func (s *dashboardService) resolveVoiceMeterID(ctx context.Context) (string, boo
 
 	config, err := utils.ToStruct[types.CustomAnalyticsConfig](setting.Value)
 	if err != nil {
-		s.Logger.WarnwCtx(ctx, "failed to parse custom analytics config", "error", err)
+		s.Logger.Info(ctx, "failed to parse custom analytics config", "error", err)
 		return "", false
 	}
 
@@ -436,14 +443,14 @@ func (s *dashboardService) resolveVoiceMeterID(ctx context.Context) (string, boo
 		if rule.TargetType == "feature" {
 			feature, err := s.FeatureRepo.Get(ctx, rule.TargetID)
 			if err != nil || feature == nil {
-				s.Logger.WarnwCtx(ctx, "failed to resolve feature for revenue-per-minute rule",
+				s.Logger.Info(ctx, "failed to resolve feature for revenue-per-minute rule",
 					"error", err,
 					"target_id", rule.TargetID,
 				)
 				return "", false
 			}
 			if feature.MeterID == "" {
-				s.Logger.WarnwCtx(ctx, "feature has no meter_id for revenue-per-minute rule",
+				s.Logger.Info(ctx, "feature has no meter_id for revenue-per-minute rule",
 					"feature_id", feature.ID,
 				)
 				return "", false

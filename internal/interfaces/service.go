@@ -2,6 +2,7 @@ package interfaces
 
 import (
 	"context"
+	"time"
 
 	"github.com/flexprice/flexprice/internal/api/dto"
 	"github.com/flexprice/flexprice/internal/domain/addonassociation"
@@ -42,6 +43,7 @@ type InvoiceService interface {
 	CreateInvoice(ctx context.Context, req dto.CreateInvoiceRequest) (*dto.InvoiceResponse, error)
 	CreateEmptyDraftInvoice(ctx context.Context, req dto.CreateDraftInvoiceRequest) (*dto.InvoiceResponse, error)
 	ComputeInvoice(ctx context.Context, invoiceID string, req *dto.InvoiceComputeRequest) (bool, error)
+	FinalizeInvoice(ctx context.Context, id string) error
 	GetInvoice(ctx context.Context, id string) (*dto.InvoiceResponse, error)
 	ListInvoices(ctx context.Context, filter *types.InvoiceFilter) (*dto.ListInvoicesResponse, error)
 	UpdateInvoice(ctx context.Context, id string, req dto.UpdateInvoiceRequest) (*dto.InvoiceResponse, error)
@@ -58,6 +60,7 @@ type PlanService interface {
 	DeletePlan(ctx context.Context, id string) error
 	ClonePlan(ctx context.Context, id string, req dto.ClonePlanRequest) (*dto.PlanResponse, error)
 	SyncPlanPrices(ctx context.Context, id string) (*dto.SyncPlanPricesResponse, error)
+	SyncPlanPricesV2(ctx context.Context, id string) (*dto.SyncPlanPricesResponse, error)
 	ReprocessEventsForMissingPairs(ctx context.Context, missingPairs []planpricesync.PlanLineItemCreationDelta) error
 }
 
@@ -68,6 +71,7 @@ type EntityIntegrationMappingService interface {
 	UpdateEntityIntegrationMapping(ctx context.Context, id string, req dto.UpdateEntityIntegrationMappingRequest) (*dto.EntityIntegrationMappingResponse, error)
 	DeleteEntityIntegrationMapping(ctx context.Context, id string) error
 	LinkIntegrationMapping(ctx context.Context, req dto.LinkIntegrationMappingRequest) (*dto.LinkIntegrationMappingResponse, error)
+	DelinkIntegrationMapping(ctx context.Context, req dto.DelinkIntegrationMappingRequest) (*dto.SuccessResponse, error)
 }
 
 // RevenueAnalyticsService defines the interface for revenue analytics operations
@@ -89,6 +93,7 @@ type SubscriptionService interface {
 	GetUsageBySubscription(ctx context.Context, req *dto.GetUsageBySubscriptionRequest) (*dto.GetUsageBySubscriptionResponse, error)
 	UpdateBillingPeriods(ctx context.Context) (*dto.SubscriptionUpdatePeriodResponse, error)
 	ProcessTrialEndDue(ctx context.Context) (*dto.SubscriptionUpdatePeriodResponse, error)
+	ProcessSingleSubscriptionTrialEnd(ctx context.Context, sub *subscription.Subscription, now time.Time) (*dto.InvoiceResponse, error)
 
 	// Pause-related methods
 	PauseSubscription(ctx context.Context, subscriptionID string, req *dto.PauseSubscriptionRequest) (*dto.PauseSubscriptionResponse, error)
@@ -113,7 +118,11 @@ type SubscriptionService interface {
 	// Auto-cancellation methods
 	ProcessAutoCancellationSubscriptions(ctx context.Context) error
 	// Renewal due alert methods
-	ProcessSubscriptionRenewalDueAlert(ctx context.Context) error
+	ProcessSubscriptionRenewalDueAlert(ctx context.Context, referenceTime time.Time) error
+
+	// ProcessAutoInvoiceThresholdBilling checks subscriptions with subscription-level auto_invoice_threshold
+	// set and runs auto invoice threshold billing (mid-period invoices when usage crosses that threshold).
+	ProcessAutoInvoiceThresholdBilling(ctx context.Context) (*dto.AutoInvoiceThresholdBillingResult, error)
 
 	// Feature usage tracking
 	GetFeatureUsageBySubscription(ctx context.Context, req *dto.GetUsageBySubscriptionRequest) (*dto.GetUsageBySubscriptionResponse, error)
@@ -157,6 +166,10 @@ type SubscriptionService interface {
 
 	// CascadeCancelToInheritedSubscriptions mirrors the parent's cancellation fields onto INHERITED child subscriptions (no-op if not a parent). Used by Temporal update-billing-period cancellation and aligned with CancelSubscription / cron processing.
 	CascadeCancelToInheritedSubscriptions(ctx context.Context, parentSub *subscription.Subscription) error
+
+	// PublishCancellationEvents publishes a update and cancel webhook event for a subscription and its inherited subs.
+	// Used by Temporal activities and other callers that need to fire subscription lifecycle events.
+	PublishCancellationEvents(ctx context.Context, sub *subscription.Subscription)
 
 	// ExternalCustomerIDsForSubscription returns distinct non-empty external customer IDs
 	// for the subscription owner plus all active/trialing/draft inherited children.

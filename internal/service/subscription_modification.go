@@ -53,9 +53,15 @@ func (s *subscriptionModificationService) Execute(ctx context.Context, subscript
 		return s.executeQuantityChange(ctx, subscriptionID, req.QuantityChangeParams)
 	case dto.SubscriptionModifyTypeGroupedInvoicing:
 		return s.executeGroupedInvoicingMembership(ctx, req.GroupedInvoicingParams)
+	case dto.SubscriptionModifyTypeTrialEnd:
+		return s.executeTrialEnd(ctx, subscriptionID, req.TrialEndParams)
+	case dto.SubscriptionModifyTypeCoupon:
+		return s.executeCouponModification(ctx, subscriptionID, req.CouponParams)
+	case dto.SubscriptionModifyTypeTax:
+		return s.executeTaxModification(ctx, subscriptionID, req.TaxParams)
 	default:
 		return nil, ierr.NewError("unknown modification type: " + string(req.Type)).
-			WithHint("Valid values: inheritance, quantity_change, grouped_invoicing").
+			WithHint("Valid values: inheritance, quantity_change, grouped_invoicing, trial_end, coupon, tax").
 			Mark(ierr.ErrValidation)
 	}
 }
@@ -73,9 +79,15 @@ func (s *subscriptionModificationService) Preview(ctx context.Context, subscript
 		return s.previewQuantityChange(ctx, subscriptionID, req.QuantityChangeParams)
 	case dto.SubscriptionModifyTypeGroupedInvoicing:
 		return s.previewGroupedInvoicingMembership(ctx, req.GroupedInvoicingParams)
+	case dto.SubscriptionModifyTypeTrialEnd:
+		return s.previewTrialEnd(ctx, subscriptionID, req.TrialEndParams)
+	case dto.SubscriptionModifyTypeCoupon:
+		return s.previewCouponModification(ctx, subscriptionID, req.CouponParams)
+	case dto.SubscriptionModifyTypeTax:
+		return s.previewTaxModification(ctx, subscriptionID, req.TaxParams)
 	default:
 		return nil, ierr.NewError("unknown modification type: " + string(req.Type)).
-			WithHint("Valid values: inheritance, quantity_change, grouped_invoicing").
+			WithHint("Valid values: inheritance, quantity_change, grouped_invoicing, trial_end, coupon, tax").
 			Mark(ierr.ErrValidation)
 	}
 }
@@ -89,6 +101,10 @@ func (s *subscriptionModificationService) executeInheritance(
 	subscriptionID string,
 	params *dto.SubModifyInheritanceRequest,
 ) (*dto.SubscriptionModifyResponse, error) {
+	if params.Action == dto.InheritanceActionRemove {
+		return s.executeRemoveInheritance(ctx, subscriptionID, params)
+	}
+
 	sp := s.serviceParams
 
 	// 1. Get subscription
@@ -108,6 +124,12 @@ func (s *subscriptionModificationService) executeInheritance(
 		return nil, ierr.NewError("subscription is not active").
 			WithHint("Only active subscriptions can be modified for inheritance").
 			WithReportableDetails(map[string]interface{}{"subscription_id": subscriptionID, "status": sub.SubscriptionStatus}).
+			Mark(ierr.ErrValidation)
+	}
+	if sub.HasPositiveAutoInvoiceThreshold() {
+		return nil, ierr.NewError("cannot add inherited subscriptions while auto_invoice_threshold is set").
+			WithHint("Remove subscription-level auto_invoice_threshold first; it applies only to standalone subscriptions").
+			WithReportableDetails(map[string]interface{}{"subscription_id": subscriptionID}).
 			Mark(ierr.ErrValidation)
 	}
 
@@ -195,6 +217,10 @@ func (s *subscriptionModificationService) previewInheritance(
 	subscriptionID string,
 	params *dto.SubModifyInheritanceRequest,
 ) (*dto.SubscriptionModifyResponse, error) {
+	if params.Action == dto.InheritanceActionRemove {
+		return s.previewRemoveInheritance(ctx, subscriptionID, params)
+	}
+
 	sp := s.serviceParams
 
 	// Get subscription (read-only)
@@ -214,6 +240,12 @@ func (s *subscriptionModificationService) previewInheritance(
 		return nil, ierr.NewError("subscription is not active").
 			WithHint("Only active subscriptions can be modified for inheritance").
 			WithReportableDetails(map[string]interface{}{"subscription_id": subscriptionID, "status": sub.SubscriptionStatus}).
+			Mark(ierr.ErrValidation)
+	}
+	if sub.HasPositiveAutoInvoiceThreshold() {
+		return nil, ierr.NewError("cannot add inherited subscriptions while auto_invoice_threshold is set").
+			WithHint("Remove subscription-level auto_invoice_threshold first; it applies only to standalone subscriptions").
+			WithReportableDetails(map[string]interface{}{"subscription_id": subscriptionID}).
 			Mark(ierr.ErrValidation)
 	}
 
@@ -416,7 +448,7 @@ func (s *subscriptionModificationService) executeQuantityChange(
 
 			// Skip no-op: quantity unchanged avoids unnecessary DB writes and a spurious invoice.
 			if change.Quantity.Equal(lineItem.Quantity) {
-				sp.Logger.Debugw("skipping quantity change: quantity is unchanged",
+				sp.Logger.Debug(ctx, "skipping quantity change: quantity is unchanged",
 					"line_item_id", change.ID, "quantity", change.Quantity)
 				continue
 			}
@@ -660,7 +692,7 @@ func (s *subscriptionModificationService) previewQuantityChange(
 			}
 			inv, err := s.previewQuantityChangeProration(ctx, sub, lineItem, previewNewItem, effectiveDate)
 			if err != nil {
-				sp.Logger.Warnw("failed to preview proration for quantity change", "error", err, "line_item_id", lineItem.ID)
+				sp.Logger.Info(context.Background(), "failed to preview proration for quantity change", "error", err, "line_item_id", lineItem.ID)
 			} else if inv != nil {
 				changedInvoices = append(changedInvoices, *inv)
 			}
@@ -786,13 +818,13 @@ func (s *subscriptionModificationService) handleQuantityChangeProration(
 			LineItems:      lineItems,
 		})
 		if err != nil {
-			sp.Logger.Errorw("failed to create delta proration invoice for quantity change", "error", err)
+			sp.Logger.Error(ctx, "failed to create delta proration invoice for quantity change", "error", err)
 			return nil, err
 		}
 		// CreateInvoice with InvoiceTypeOneOff already finalizes the invoice internally.
 		// Attempt payment (credits + payment method charge).
 		if err := invoiceSvc.AttemptPayment(ctx, inv.ID); err != nil {
-			sp.Logger.Warnw("failed to attempt payment for delta proration invoice", "error", err, "invoice_id", inv.ID)
+			sp.Logger.Info(context.Background(), "failed to attempt payment for delta proration invoice", "error", err, "invoice_id", inv.ID)
 		}
 		// Re-fetch to get latest payment status after finalize+payment attempt.
 		latest, fetchErr := invoiceSvc.GetInvoice(ctx, inv.ID)
@@ -815,7 +847,7 @@ func (s *subscriptionModificationService) handleQuantityChangeProration(
 	idempotencyKey := fmt.Sprintf("proration_credit_%s_%s_%s", sub.ID, oldItem.ID, effectiveDate.Format(time.RFC3339))
 	walletTx, err := walletSvc.TopUpWalletForProratedCharge(ctx, billingCustomer, creditAmount, sub.Currency, idempotencyKey)
 	if err != nil {
-		sp.Logger.Errorw("failed to top up wallet for downgrade proration", "error", err)
+		sp.Logger.Error(ctx, "failed to top up wallet for downgrade proration", "error", err)
 		return nil, err
 	}
 	changedID := "(wallet_credit)"
@@ -1046,7 +1078,29 @@ func (s *subscriptionModificationService) previewQuantityChangeProration(
 
 // resolveExternalCustomersForInheritance resolves published customers by external ID and validates
 // they may receive an inherited subscription.
-func (s *subscriptionModificationService) resolveExternalCustomersForInheritance(ctx context.Context, subscriberCustomerID string, externalIDs []string) ([]string, error) {
+func (s *subscriptionModificationService) resolveExternalCustomersForInheritance(ctx context.Context, parentCustomerID string, externalIDs []string) ([]string, error) {
+	// Step 1: fetch all subscription IDs belonging to the parent customer.
+	// These are used to distinguish "already under this parent" (allowed) from
+	// "under a different parent" (blocked).
+	parentSubFilter := types.NewNoLimitSubscriptionFilter()
+	parentSubFilter.CustomerID = parentCustomerID
+	parentSubFilter.Status = lo.ToPtr(types.StatusPublished)
+	parentSubFilter.SubscriptionStatus = []types.SubscriptionStatus{
+		types.SubscriptionStatusActive,
+		types.SubscriptionStatusDraft,
+		types.SubscriptionStatusTrialing,
+	}
+	parentSubFilter.WithLineItems = false
+	parentSubs, err := s.serviceParams.SubRepo.List(ctx, parentSubFilter)
+	if err != nil {
+		return nil, err
+	}
+	parentSubIDs := make(map[string]bool, len(parentSubs))
+	for _, sub := range parentSubs {
+		parentSubIDs[sub.ID] = true
+	}
+
+	// Step 2: resolve child customers by external ID.
 	childFilter := types.NewNoLimitCustomerFilter()
 	childFilter.ExternalIDs = externalIDs
 	childFilter.Status = lo.ToPtr(types.StatusPublished)
@@ -1069,7 +1123,7 @@ func (s *subscriptionModificationService) resolveExternalCustomersForInheritance
 				WithReportableDetails(map[string]interface{}{"external_id": extID}).
 				Mark(ierr.ErrNotFound)
 		}
-		if cust.ID == subscriberCustomerID {
+		if cust.ID == parentCustomerID {
 			return nil, ierr.NewError("cannot inherit onto itself").
 				WithHint("The subscriber cannot appear in external_customer_ids_to_inherit_subscription").
 				WithReportableDetails(map[string]interface{}{"external_id": extID, "customer_id": cust.ID}).
@@ -1081,6 +1135,43 @@ func (s *subscriptionModificationService) resolveExternalCustomersForInheritance
 				WithReportableDetails(map[string]interface{}{"external_id": extID, "customer_id": cust.ID}).
 				Mark(ierr.ErrValidation)
 		}
+
+		// Step 3: fetch all active/draft/trialing published subscriptions for the child.
+		childSubFilter := types.NewNoLimitSubscriptionFilter()
+		childSubFilter.CustomerID = cust.ID
+		childSubFilter.Status = lo.ToPtr(types.StatusPublished)
+		childSubFilter.SubscriptionStatus = []types.SubscriptionStatus{
+			types.SubscriptionStatusActive,
+			types.SubscriptionStatusDraft,
+			types.SubscriptionStatusTrialing,
+		}
+		childSubFilter.WithLineItems = false
+		childSubs, err := s.serviceParams.SubRepo.List(ctx, childSubFilter)
+		if err != nil {
+			return nil, err
+		}
+
+		// Step 4: check each subscription of the child.
+		// Block if:
+		//   - subscription has no parent (child has their own standalone/parent subscription), OR
+		//   - subscription's parent belongs to a different parent customer (not parentSubIDs)
+		for _, childSub := range childSubs {
+			if childSub.ParentSubscriptionID == nil {
+				// Child has a standalone or parent subscription of their own
+				return nil, ierr.NewError("child customer has standalone or parent subscriptions").
+					WithHint("The child customer cannot have standalone or parent subscriptions").
+					WithReportableDetails(map[string]interface{}{"external_id": extID, "customer_id": cust.ID}).
+					Mark(ierr.ErrValidation)
+			}
+			if !parentSubIDs[*childSub.ParentSubscriptionID] {
+				// Child is already inherited under a different parent
+				return nil, ierr.NewError("child customer already has a parent subscription").
+					WithHint("A customer can only be inherited under one parent").
+					WithReportableDetails(map[string]interface{}{"external_id": extID, "customer_id": cust.ID}).
+					Mark(ierr.ErrValidation)
+			}
+		}
+
 		childCustomerIDs = append(childCustomerIDs, cust.ID)
 	}
 	return childCustomerIDs, nil
@@ -1153,7 +1244,7 @@ func (s *subscriptionModificationService) publishSystemEvent(ctx context.Context
 
 	webhookPayload, err := json.Marshal(eventPayload)
 	if err != nil {
-		s.serviceParams.Logger.ErrorwCtx(ctx, "failed to marshal webhook payload", "error", err)
+		s.serviceParams.Logger.Error(ctx, "failed to marshal webhook payload", "error", err)
 		return
 	}
 
@@ -1169,6 +1260,268 @@ func (s *subscriptionModificationService) publishSystemEvent(ctx context.Context
 		EntityID:      subscriptionID,
 	}
 	if err := s.serviceParams.WebhookPublisher.PublishWebhook(ctx, webhookEvent); err != nil {
-		s.serviceParams.Logger.ErrorfCtx(ctx, "failed to publish %s event: %v", webhookEvent.EventName, err)
+		s.serviceParams.Logger.Error(ctx, "failed to publish webhook event", "event_name", webhookEvent.EventName, "error", err)
 	}
+}
+
+// ─────────────────────────────────────────────
+// Sub-feature: Remove Inheritance
+// ─────────────────────────────────────────────
+
+// resolveCustomersByExternalIDs converts external customer IDs to internal IDs.
+// Unlike resolveExternalCustomersForInheritance, this does not require StatusPublished
+// since we are removing (not adding) children.
+func (s *subscriptionModificationService) resolveCustomersByExternalIDs(ctx context.Context, externalIDs []string) ([]string, error) {
+	childFilter := types.NewNoLimitCustomerFilter()
+	childFilter.ExternalIDs = externalIDs
+	childFilter.Status = lo.ToPtr(types.StatusPublished)
+	customers, err := s.serviceParams.CustomerRepo.List(ctx, childFilter)
+	if err != nil {
+		return nil, err
+	}
+
+	byExternalID := make(map[string]*customer.Customer, len(customers))
+	for _, c := range customers {
+		byExternalID[c.ExternalID] = c
+	}
+
+	result := make([]string, 0, len(externalIDs))
+	for _, extID := range externalIDs {
+		c, ok := byExternalID[extID]
+		if !ok {
+			return nil, ierr.NewError("customer not found").
+				WithHint("No customer exists for the given external ID").
+				WithReportableDetails(map[string]interface{}{"external_id": extID}).
+				Mark(ierr.ErrNotFound)
+		}
+		result = append(result, c.ID)
+	}
+	return result, nil
+}
+
+// getInheritedSubscriptionsForChildCustomer returns active, trialing, or paused inherited
+// subscriptions for a child customer under the specified parent subscription.
+func (s *subscriptionModificationService) getInheritedSubscriptionsForChildCustomer(ctx context.Context, parentSubID, childCustomerID string) ([]*subscription.Subscription, error) {
+	filter := types.NewNoLimitSubscriptionFilter()
+	filter.ParentSubscriptionIDs = []string{parentSubID}
+	filter.SubscriptionTypes = []types.SubscriptionType{types.SubscriptionTypeInherited}
+	filter.SubscriptionStatus = []types.SubscriptionStatus{
+		types.SubscriptionStatusActive,
+		types.SubscriptionStatusTrialing,
+		types.SubscriptionStatusPaused,
+	}
+	filter.CustomerID = childCustomerID
+
+	subs, err := s.serviceParams.SubRepo.List(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	if len(subs) == 0 {
+		return nil, ierr.NewError("inherited subscription not found for child customer").
+			WithHint("No active inherited subscription exists for this child customer under the given parent").
+			WithReportableDetails(map[string]interface{}{
+				"parent_subscription_id": parentSubID,
+				"child_customer_id":      childCustomerID,
+			}).
+			Mark(ierr.ErrNotFound)
+	}
+	return subs, nil
+}
+
+func (s *subscriptionModificationService) getInheritedSubscriptionsForChildCustomers(
+	ctx context.Context,
+	parentSubID string,
+	childCustomerIDs []string,
+) ([]*subscription.Subscription, error) {
+	childSubs := make([]*subscription.Subscription, 0, len(childCustomerIDs))
+	for _, childCustomerID := range childCustomerIDs {
+		subs, err := s.getInheritedSubscriptionsForChildCustomer(ctx, parentSubID, childCustomerID)
+		if err != nil {
+			return nil, err
+		}
+		childSubs = append(childSubs, subs...)
+	}
+	return childSubs, nil
+}
+
+func validateInheritedSubscriptionsNotScheduledForRemoval(subs []*subscription.Subscription) error {
+	if sub, found := lo.Find(subs, func(sub *subscription.Subscription) bool {
+		return sub.CancelAt != nil
+	}); found {
+		return ierr.NewError("inherited subscription is already scheduled for removal").
+			WithHint("The inherited subscription already has a scheduled cancellation").
+			WithReportableDetails(map[string]interface{}{
+				"child_subscription_id": sub.ID,
+			}).
+			Mark(ierr.ErrValidation)
+	}
+	return nil
+}
+
+func (s *subscriptionModificationService) executeRemoveInheritance(
+	ctx context.Context,
+	subscriptionID string,
+	params *dto.SubModifyInheritanceRequest,
+) (*dto.SubscriptionModifyResponse, error) {
+	sp := s.serviceParams
+
+	// 1. Fetch and validate parent
+	parentSub, err := sp.SubRepo.Get(ctx, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	if parentSub.SubscriptionType != types.SubscriptionTypeParent {
+		return nil, ierr.NewError("subscription is not a parent subscription").
+			WithHint("Only parent subscriptions can have inherited children removed").
+			WithReportableDetails(map[string]interface{}{
+				"subscription_id":   subscriptionID,
+				"subscription_type": parentSub.SubscriptionType,
+			}).
+			Mark(ierr.ErrValidation)
+	}
+	if parentSub.SubscriptionStatus != types.SubscriptionStatusActive &&
+		parentSub.SubscriptionStatus != types.SubscriptionStatusTrialing {
+		return nil, ierr.NewError("parent subscription is not active or trialing").
+			WithHint("The parent subscription must be active or trialing to remove inherited children").
+			WithReportableDetails(map[string]interface{}{
+				"subscription_id": subscriptionID,
+				"status":          parentSub.SubscriptionStatus,
+			}).
+			Mark(ierr.ErrValidation)
+	}
+
+	// 2. Resolve external customer IDs → internal IDs (no status check for remove)
+	externalIDs := lo.Uniq(params.ExternalCustomerIDsToRemove)
+	childCustomerIDs, err := s.resolveCustomersByExternalIDs(ctx, externalIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. Find each child's inherited sub and guard against double-scheduling
+	childSubs, err := s.getInheritedSubscriptionsForChildCustomers(ctx, subscriptionID, childCustomerIDs)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateInheritedSubscriptionsNotScheduledForRemoval(childSubs); err != nil {
+		return nil, err
+	}
+
+	// 4. Effective date = parent's current period end
+	effectiveDate := parentSub.CurrentPeriodEnd
+
+	// 5. Transaction: schedule each inherited sub for cancellation at period end
+	changedSubs := make([]dto.ChangedSubscription, 0, len(childSubs))
+	err = sp.DB.WithTx(ctx, func(txCtx context.Context) error {
+		changedSubs = nil
+		for _, childSub := range childSubs {
+			childSub.CancelAt = lo.ToPtr(effectiveDate)
+			childSub.CancelAtPeriodEnd = true
+			if err := sp.SubRepo.Update(txCtx, childSub); err != nil {
+				return ierr.WithError(err).
+					WithHint("Failed to schedule inherited subscription for removal").
+					WithReportableDetails(map[string]interface{}{
+						"child_subscription_id": childSub.ID,
+					}).
+					Mark(ierr.ErrDatabase)
+			}
+			changedSubs = append(changedSubs, dto.ChangedSubscription{
+				ID:               childSub.ID,
+				Action:           dto.ChangedSubscriptionActionUpdated,
+				Status:           childSub.SubscriptionStatus,
+				CurrentPeriodEnd: lo.ToPtr(effectiveDate),
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// 6. Publish webhook event
+	s.publishSystemEvent(ctx, types.WebhookEventSubscriptionUpdated, subscriptionID)
+
+	// 7. Return response with parent subscription and changed children
+	subSvc := NewSubscriptionService(sp)
+	subResp, err := subSvc.GetSubscription(ctx, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &dto.SubscriptionModifyResponse{
+		Subscription: subResp,
+		ChangedResources: dto.ChangedResources{
+			Subscriptions: changedSubs,
+		},
+	}, nil
+}
+
+func (s *subscriptionModificationService) previewRemoveInheritance(
+	ctx context.Context,
+	subscriptionID string,
+	params *dto.SubModifyInheritanceRequest,
+) (*dto.SubscriptionModifyResponse, error) {
+	sp := s.serviceParams
+
+	// Validate parent (same as execute, no DB writes)
+	parentSub, err := sp.SubRepo.Get(ctx, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	if parentSub.SubscriptionType != types.SubscriptionTypeParent {
+		return nil, ierr.NewError("subscription is not a parent subscription").
+			WithHint("Only parent subscriptions can have inherited children removed").
+			WithReportableDetails(map[string]interface{}{
+				"subscription_id":   subscriptionID,
+				"subscription_type": parentSub.SubscriptionType,
+			}).
+			Mark(ierr.ErrValidation)
+	}
+	if parentSub.SubscriptionStatus != types.SubscriptionStatusActive &&
+		parentSub.SubscriptionStatus != types.SubscriptionStatusTrialing {
+		return nil, ierr.NewError("parent subscription is not active or trialing").
+			WithHint("The parent subscription must be active or trialing to remove inherited children").
+			WithReportableDetails(map[string]interface{}{
+				"subscription_id": subscriptionID,
+				"status":          parentSub.SubscriptionStatus,
+			}).
+			Mark(ierr.ErrValidation)
+	}
+
+	// Resolve customers
+	externalIDs := lo.Uniq(params.ExternalCustomerIDsToRemove)
+	childCustomerIDs, err := s.resolveCustomersByExternalIDs(ctx, externalIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate children and build preview response (no DB mutations)
+	effectiveDate := parentSub.CurrentPeriodEnd
+	childSubs, err := s.getInheritedSubscriptionsForChildCustomers(ctx, subscriptionID, childCustomerIDs)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateInheritedSubscriptionsNotScheduledForRemoval(childSubs); err != nil {
+		return nil, err
+	}
+	changedSubs := lo.Map(childSubs, func(childSub *subscription.Subscription, _ int) dto.ChangedSubscription {
+		return dto.ChangedSubscription{
+			ID:               childSub.ID,
+			Action:           dto.ChangedSubscriptionActionUpdated,
+			Status:           childSub.SubscriptionStatus,
+			CurrentPeriodEnd: lo.ToPtr(effectiveDate),
+		}
+	})
+
+	subSvc := NewSubscriptionService(sp)
+	subResp, err := subSvc.GetSubscription(ctx, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &dto.SubscriptionModifyResponse{
+		Subscription: subResp,
+		ChangedResources: dto.ChangedResources{
+			Subscriptions: changedSubs,
+		},
+	}, nil
 }

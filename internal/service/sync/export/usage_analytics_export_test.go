@@ -9,6 +9,8 @@ import (
 	"github.com/flexprice/flexprice/internal/api/dto"
 	"github.com/flexprice/flexprice/internal/domain/customer"
 	"github.com/flexprice/flexprice/internal/domain/events"
+	"github.com/flexprice/flexprice/internal/domain/group"
+	"github.com/flexprice/flexprice/internal/domain/subscription"
 	"github.com/flexprice/flexprice/internal/logger"
 	"github.com/flexprice/flexprice/internal/testutil"
 	"github.com/flexprice/flexprice/internal/types"
@@ -40,6 +42,7 @@ type usageAnalyticsTestEnv struct {
 	exporter        *UsageAnalyticsExporter
 	customerStore   *testutil.InMemoryCustomerStore
 	eventRepo       *testutil.InMemoryEventStore
+	lineItemStore   *testutil.InMemorySubscriptionLineItemStore
 	analyticsGetter *inMemoryUsageAnalyticsGetter
 	req             *dto.ExportRequest
 	ctx             context.Context
@@ -47,6 +50,7 @@ type usageAnalyticsTestEnv struct {
 	envID           string
 	now             time.Time
 	eventSeq        int
+	lineItemSeq     int
 }
 
 func newUsageAnalyticsTestEnv(t *testing.T) *usageAnalyticsTestEnv {
@@ -59,11 +63,12 @@ func newUsageAnalyticsTestEnv(t *testing.T) *usageAnalyticsTestEnv {
 	ctx = types.SetEnvironmentID(ctx, envID)
 
 	customerStore := testutil.NewInMemoryCustomerStore()
-	analyticsGetter := newInMemoryUsageAnalyticsGetter()
-	log := logger.GetLogger()
 	eventRepo := testutil.NewInMemoryEventStore()
+	lineItemStore := testutil.NewInMemorySubscriptionLineItemStore()
+	analyticsGetter := newInMemoryUsageAnalyticsGetter()
+	log := logger.NewNoopLogger()
 
-	exporter := NewUsageAnalyticsExporter(customerStore, eventRepo, analyticsGetter, log)
+	exporter := NewUsageAnalyticsExporter(customerStore, eventRepo, lineItemStore, analyticsGetter, log)
 
 	now := time.Now().UTC()
 	req := &dto.ExportRequest{
@@ -79,6 +84,7 @@ func newUsageAnalyticsTestEnv(t *testing.T) *usageAnalyticsTestEnv {
 		exporter:        exporter,
 		customerStore:   customerStore,
 		eventRepo:       eventRepo,
+		lineItemStore:   lineItemStore,
 		analyticsGetter: analyticsGetter,
 		req:             req,
 		ctx:             ctx,
@@ -125,6 +131,30 @@ func (e *usageAnalyticsTestEnv) addEvent(t *testing.T, externalCustomerID string
 	}
 }
 
+func (e *usageAnalyticsTestEnv) addCommitmentTrueUpLineItem(t *testing.T, customerID string) {
+	t.Helper()
+	e.lineItemSeq++
+	item := &subscription.SubscriptionLineItem{
+		ID:                      fmt.Sprintf("sli-%s-%d", customerID, e.lineItemSeq),
+		SubscriptionID:          fmt.Sprintf("sub-%s", customerID),
+		CustomerID:              customerID,
+		PriceID:                 "price-1",
+		Currency:                "USD",
+		BillingPeriod:           types.BILLING_PERIOD_MONTHLY,
+		EnvironmentID:           e.envID,
+		CommitmentTrueUpEnabled: true,
+		BaseModel: types.BaseModel{
+			TenantID:  e.tenantID,
+			Status:    types.StatusPublished,
+			CreatedAt: e.now,
+			UpdatedAt: e.now,
+		},
+	}
+	if err := e.lineItemStore.Create(e.ctx, item); err != nil {
+		t.Fatalf("create commitment true-up line item for customer %s: %v", customerID, err)
+	}
+}
+
 func TestUsageAnalyticsExporter_PrepareData(t *testing.T) {
 	staticCols := []string{
 		string(UsageAnalyticsCSVHeadersCustomerName),
@@ -134,8 +164,10 @@ func TestUsageAnalyticsExporter_PrepareData(t *testing.T) {
 		string(UsageAnalyticsCSVHeadersEndTime),
 		string(UsageAnalyticsCSVHeadersFeatureName),
 		string(UsageAnalyticsCSVHeadersFeatureID),
+		string(UsageAnalyticsCSVHeadersFeatureGroupName),
 		string(UsageAnalyticsCSVHeadersEventName),
 		string(UsageAnalyticsCSVHeadersEventCount),
+		string(UsageAnalyticsCSVHeadersAggregationField),
 		string(UsageAnalyticsCSVHeadersTotalUsage),
 		string(UsageAnalyticsCSVHeadersTotalCost),
 		string(UsageAnalyticsCSVHeadersCurrency),
@@ -170,18 +202,30 @@ func TestUsageAnalyticsExporter_PrepareData(t *testing.T) {
 			},
 		},
 		{
-			name: "customer with no events in window produces no rows",
+			name: "customer with events in window but no commitment true-up line item",
 			setup: func(t *testing.T, env *usageAnalyticsTestEnv) {
-				env.addCustomer(t, "cust-1", "ext-1", "Idle Corp", nil)
+				c := env.addCustomer(t, "cust-1", "ext-1", "Event Only Corp", nil)
+				env.addEvent(t, c.ExternalID, env.req.StartTime.Add(1*time.Minute))
+				env.setAnalytics(c.ExternalID, []dto.UsageAnalyticItem{
+					{FeatureID: "feat-1", FeatureName: "API Calls", EventName: "api_call", EventCount: 3, TotalUsage: decimal.NewFromInt(3), TotalCost: decimal.NewFromInt(1), Currency: "USD"},
+				})
+			},
+			wantCount: 1,
+			wantRows:  1,
+		},
+		{
+			name: "customer without events or commitment true-up produces no rows",
+			setup: func(t *testing.T, env *usageAnalyticsTestEnv) {
+				env.addCustomer(t, "cust-idle", "ext-idle", "Idle Corp", nil)
 			},
 			wantCount: 0,
 			wantRows:  0,
 		},
 		{
-			name: "customer with events but empty analytics produces no rows",
+			name: "customer with commitment true-up but empty analytics produces no rows",
 			setup: func(t *testing.T, env *usageAnalyticsTestEnv) {
 				c := env.addCustomer(t, "cust-ghost", "ext-ghost", "Ghost Corp", nil)
-				env.addEvent(t, c.ExternalID, env.req.StartTime.Add(1*time.Minute))
+				env.addCommitmentTrueUpLineItem(t, c.ID)
 				// No explicit setAnalytics call: getter returns empty Items by default.
 			},
 			wantCount: 0,
@@ -192,15 +236,17 @@ func TestUsageAnalyticsExporter_PrepareData(t *testing.T) {
 			setup: func(t *testing.T, env *usageAnalyticsTestEnv) {
 				c := env.addCustomer(t, "cust-2", "ext-2", "Acme Corp", nil)
 				env.addEvent(t, c.ExternalID, env.req.StartTime.Add(1*time.Minute))
+				env.addCommitmentTrueUpLineItem(t, c.ID)
 				env.setAnalytics(c.ExternalID, []dto.UsageAnalyticItem{
 					{
-						FeatureID:   "feat-1",
-						FeatureName: "API Calls",
-						EventName:   "api_call",
-						EventCount:  42,
-						TotalUsage:  decimal.NewFromInt(42),
-						TotalCost:   decimal.NewFromFloat(4.20),
-						Currency:    "USD",
+						FeatureID:       "feat-1",
+						FeatureName:     "API Calls",
+						EventName:       "api_call",
+						EventCount:      42,
+						TotalUsage:      decimal.NewFromInt(42),
+						TotalCost:       decimal.NewFromFloat(4.20),
+						Currency:        "USD",
+						AggregationType: types.AggregationCount,
 					},
 				})
 			},
@@ -238,6 +284,43 @@ func TestUsageAnalyticsExporter_PrepareData(t *testing.T) {
 				if got := col(string(UsageAnalyticsCSVHeadersCurrency)); got != "USD" {
 					t.Errorf("currency: want USD got %q", got)
 				}
+				if got := col(string(UsageAnalyticsCSVHeadersFeatureGroupName)); got != "" {
+					t.Errorf("feature_group_name: want empty got %q", got)
+				}
+				if got := col(string(UsageAnalyticsCSVHeadersAggregationField)); got != string(types.AggregationCount) {
+					t.Errorf("aggregation_field: want %q got %q", types.AggregationCount, got)
+				}
+			},
+		},
+		{
+			name: "feature group name and aggregation field populated",
+			setup: func(t *testing.T, env *usageAnalyticsTestEnv) {
+				c := env.addCustomer(t, "cust-grp", "ext-grp", "Group Corp", nil)
+				env.addCommitmentTrueUpLineItem(t, c.ID)
+				env.setAnalytics(c.ExternalID, []dto.UsageAnalyticItem{
+					{
+						FeatureID:       "feat-grp",
+						FeatureName:     "LLM Calls",
+						EventName:       "llm_call",
+						EventCount:      10,
+						TotalUsage:      decimal.NewFromInt(10),
+						TotalCost:       decimal.NewFromInt(1),
+						Currency:        "USD",
+						AggregationType: types.AggregationSum,
+						Group:           &group.Group{ID: "grp-1", Name: "AI Features"},
+					},
+				})
+			},
+			wantCount: 1,
+			wantRows:  1,
+			assertRow: func(t *testing.T, headers []string, rows [][]string, _ *usageAnalyticsTestEnv) {
+				col := func(name string) string { return colVal(t, headers, rows[0], name) }
+				if got := col(string(UsageAnalyticsCSVHeadersFeatureGroupName)); got != "AI Features" {
+					t.Errorf("feature_group_name: want 'AI Features' got %q", got)
+				}
+				if got := col(string(UsageAnalyticsCSVHeadersAggregationField)); got != string(types.AggregationSum) {
+					t.Errorf("aggregation_field: want %q got %q", types.AggregationSum, got)
+				}
 			},
 		},
 		{
@@ -245,8 +328,8 @@ func TestUsageAnalyticsExporter_PrepareData(t *testing.T) {
 			setup: func(t *testing.T, env *usageAnalyticsTestEnv) {
 				c1 := env.addCustomer(t, "cust-3", "ext-3", "Alpha Inc", nil)
 				c2 := env.addCustomer(t, "cust-4", "ext-4", "Beta Ltd", nil)
-				env.addEvent(t, c1.ExternalID, env.req.StartTime.Add(1*time.Minute))
-				env.addEvent(t, c2.ExternalID, env.req.StartTime.Add(2*time.Minute))
+				env.addCommitmentTrueUpLineItem(t, c1.ID)
+				env.addCommitmentTrueUpLineItem(t, c2.ID)
 				env.setAnalytics(c1.ExternalID, []dto.UsageAnalyticItem{
 					{FeatureID: "feat-a", FeatureName: "Storage", EventName: "storage_write", EventCount: 10, TotalUsage: decimal.NewFromInt(10), TotalCost: decimal.NewFromInt(1), Currency: "USD"},
 					{FeatureID: "feat-b", FeatureName: "Compute", EventName: "compute_run", EventCount: 5, TotalUsage: decimal.NewFromInt(5), TotalCost: decimal.NewFromFloat(0.5), Currency: "USD"},
@@ -262,7 +345,7 @@ func TestUsageAnalyticsExporter_PrepareData(t *testing.T) {
 			name: "customer metadata dynamic columns",
 			setup: func(t *testing.T, env *usageAnalyticsTestEnv) {
 				c := env.addCustomer(t, "cust-5", "ext-5", "Meta Corp", map[string]string{"plan_tier": "enterprise", "region": "us-east"})
-				env.addEvent(t, c.ExternalID, env.req.StartTime.Add(1*time.Minute))
+				env.addCommitmentTrueUpLineItem(t, c.ID)
 				env.setAnalytics(c.ExternalID, []dto.UsageAnalyticItem{
 					{FeatureID: "feat-1", FeatureName: "API Calls", EventName: "api_call", EventCount: 100, TotalUsage: decimal.NewFromInt(100), TotalCost: decimal.NewFromInt(10), Currency: "USD"},
 				})
@@ -310,7 +393,7 @@ func TestUsageAnalyticsExporter_PrepareData(t *testing.T) {
 			name: "source column populated when analytics returns source",
 			setup: func(t *testing.T, env *usageAnalyticsTestEnv) {
 				c := env.addCustomer(t, "cust-src", "ext-src", "Source Corp", nil)
-				env.addEvent(t, c.ExternalID, env.req.StartTime.Add(1*time.Minute))
+				env.addCommitmentTrueUpLineItem(t, c.ID)
 				env.setAnalytics(c.ExternalID, []dto.UsageAnalyticItem{
 					{FeatureID: "feat-1", FeatureName: "LLM Calls", EventName: "llm_call", Source: "gemma4_389f6963-c14f-44d0-afc3-d7e89c6a5ab8", EventCount: 10, TotalUsage: decimal.NewFromInt(10), TotalCost: decimal.NewFromInt(1), Currency: "USD"},
 					{FeatureID: "feat-1", FeatureName: "LLM Calls", EventName: "llm_call", Source: "gpt4o_7a2b1c3d-beef-cafe-dead-000000000001", EventCount: 5, TotalUsage: decimal.NewFromInt(5), TotalCost: decimal.NewFromFloat(0.5), Currency: "USD"},
@@ -334,7 +417,7 @@ func TestUsageAnalyticsExporter_PrepareData(t *testing.T) {
 			name: "missing metadata key produces empty cell",
 			setup: func(t *testing.T, env *usageAnalyticsTestEnv) {
 				c := env.addCustomer(t, "cust-6", "ext-6", "Sparse Corp", map[string]string{"plan_tier": "starter"})
-				env.addEvent(t, c.ExternalID, env.req.StartTime.Add(1*time.Minute))
+				env.addCommitmentTrueUpLineItem(t, c.ID)
 				env.setAnalytics(c.ExternalID, []dto.UsageAnalyticItem{
 					{FeatureID: "feat-1", FeatureName: "API Calls", EventName: "api_call", EventCount: 1, TotalUsage: decimal.NewFromInt(1), TotalCost: decimal.NewFromFloat(0.1), Currency: "USD"},
 				})

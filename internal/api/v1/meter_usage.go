@@ -24,19 +24,6 @@ func NewMeterUsageHandler(meterUsageService service.MeterUsageService, log *logg
 	}
 }
 
-// QueryUsage queries aggregated usage for a single meter
-// @Summary Query meter usage
-// @ID queryMeterUsage
-// @Description Query aggregated usage from meter_usage table for a single meter with optional time-window bucketing
-// @Tags MeterUsage
-// @Accept json
-// @Produce json
-// @Security ApiKeyAuth
-// @Param request body dto.MeterUsageQueryRequest true "Query parameters"
-// @Success 200 {object} dto.MeterUsageQueryResponse
-// @Failure 400 {object} ierr.ErrorResponse "Invalid request"
-// @Failure 500 {object} ierr.ErrorResponse "Server error"
-// @Router /meter-usage/query [post]
 func (h *MeterUsageHandler) QueryUsage(c *gin.Context) {
 	ctx := c.Request.Context()
 
@@ -59,7 +46,7 @@ func (h *MeterUsageHandler) QueryUsage(c *gin.Context) {
 
 	result, err := h.meterUsageService.GetUsage(ctx, params)
 	if err != nil {
-		h.log.ErrorwCtx(ctx, "failed to query meter usage",
+		h.log.Error(ctx, "failed to query meter usage",
 			"error", err,
 			"meter_id", req.MeterID,
 		)
@@ -70,19 +57,6 @@ func (h *MeterUsageHandler) QueryUsage(c *gin.Context) {
 	c.JSON(http.StatusOK, dto.ToMeterUsageQueryResponse(result))
 }
 
-// GetAnalytics queries aggregated usage for multiple meters
-// @Summary Get meter usage analytics
-// @ID getMeterUsageAnalytics
-// @Description Query aggregated usage from meter_usage table for multiple meters
-// @Tags MeterUsage
-// @Accept json
-// @Produce json
-// @Security ApiKeyAuth
-// @Param request body dto.MeterUsageAnalyticsRequest true "Analytics parameters"
-// @Success 200 {object} dto.MeterUsageAnalyticsResponse
-// @Failure 400 {object} ierr.ErrorResponse "Invalid request"
-// @Failure 500 {object} ierr.ErrorResponse "Server error"
-// @Router /meter-usage/analytics [post]
 func (h *MeterUsageHandler) GetAnalytics(c *gin.Context) {
 	ctx := c.Request.Context()
 
@@ -105,7 +79,7 @@ func (h *MeterUsageHandler) GetAnalytics(c *gin.Context) {
 
 	results, err := h.meterUsageService.GetUsageMultiMeter(ctx, params)
 	if err != nil {
-		h.log.ErrorwCtx(ctx, "failed to query meter usage analytics",
+		h.log.Error(ctx, "failed to query meter usage analytics",
 			"error", err,
 			"meter_ids", req.MeterIDs,
 		)
@@ -114,4 +88,37 @@ func (h *MeterUsageHandler) GetAnalytics(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, dto.ToMeterUsageAnalyticsResponse(results))
+}
+
+func (h *MeterUsageHandler) GetDetailedAnalytics(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	var req dto.MeterUsageDetailedAnalyticsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.Error(ierr.NewError("invalid request payload").
+			WithHint("Check your request body").
+			Mark(ierr.ErrValidation))
+		return
+	}
+
+	if err := req.Validate(); err != nil {
+		c.Error(err)
+		return
+	}
+
+	tenantID := types.GetTenantID(ctx)
+	environmentID := types.GetEnvironmentID(ctx)
+	params := req.ToParams(tenantID, environmentID)
+
+	response, err := h.meterUsageService.GetDetailedAnalytics(ctx, params)
+	if err != nil {
+		h.log.Error(ctx, "failed to query detailed meter usage analytics",
+			"error", err,
+			"meter_ids", req.MeterIDs,
+		)
+		c.Error(err)
+		return
+	}
+
+	c.JSON(http.StatusOK, response)
 }

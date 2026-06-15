@@ -1,6 +1,8 @@
 package types
 
 import (
+	"time"
+
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/samber/lo"
 )
@@ -30,7 +32,7 @@ type SecretProvider string
 const (
 	SecretProviderFlexPrice  SecretProvider = "flexprice"
 	SecretProviderStripe     SecretProvider = "stripe"
-	SecretProviderS3         SecretProvider = "s3"
+	SecretProviderS3         SecretProvider = "s3" // supports multiple connections per environment
 	SecretProviderHubSpot    SecretProvider = "hubspot"
 	SecretProviderRazorpay   SecretProvider = "razorpay"
 	SecretProviderChargebee  SecretProvider = "chargebee"
@@ -39,6 +41,7 @@ const (
 	SecretProviderNomod      SecretProvider = "nomod"
 	SecretProviderMoyasar    SecretProvider = "moyasar"
 	SecretProviderPaddle     SecretProvider = "paddle"
+	SecretProviderWhop       SecretProvider = "whop"
 )
 
 func (p SecretProvider) Validate() error {
@@ -54,6 +57,7 @@ func (p SecretProvider) Validate() error {
 		SecretProviderNomod,
 		SecretProviderMoyasar,
 		SecretProviderPaddle,
+		SecretProviderWhop,
 	}
 	if !lo.Contains(allowedSecretProviders, p) {
 		return ierr.NewError("invalid secret provider").
@@ -68,9 +72,11 @@ type SecretFilter struct {
 	*QueryFilter
 	*TimeRangeFilter
 
-	Type     *SecretType     `json:"type,omitempty" form:"type"`
-	Provider *SecretProvider `json:"provider,omitempty" form:"provider"`
-	Prefix   *string         `json:"prefix,omitempty" form:"prefix"`
+	Type         *SecretType     `json:"type,omitempty" form:"type"`
+	Provider     *SecretProvider `json:"provider,omitempty" form:"provider"`
+	Prefix       *string         `json:"prefix,omitempty" form:"prefix"`
+	UserID       *string         `json:"user_id,omitempty" form:"user_id"`
+	NotExpiredAt *time.Time      `json:"-"` // exclude records expired before this time (expires_at IS NULL OR expires_at > value)
 }
 
 func NewSecretFilter() *SecretFilter {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"entgo.io/ent/schema/field"
 	"github.com/flexprice/flexprice/ent/costsheet"
@@ -496,6 +497,12 @@ func (pc *PriceCreate) SetNillableGroupID(s *string) *PriceCreate {
 	return pc
 }
 
+// SetSequence sets the "sequence" field.
+func (pc *PriceCreate) SetSequence(i int64) *PriceCreate {
+	pc.mutation.SetSequence(i)
+	return pc
+}
+
 // SetID sets the "id" field.
 func (pc *PriceCreate) SetID(s string) *PriceCreate {
 	pc.mutation.SetID(s)
@@ -743,6 +750,12 @@ func (pc *PriceCreate) check() error {
 			return &ValidationError{Name: "entity_id", err: fmt.Errorf(`ent: validator failed for field "Price.entity_id": %w`, err)}
 		}
 	}
+	switch pc.driver.Dialect() {
+	case dialect.MySQL, dialect.SQLite:
+		if _, ok := pc.mutation.Sequence(); !ok {
+			return &ValidationError{Name: "sequence", err: errors.New(`ent: missing required field "Price.sequence"`)}
+		}
+	}
 	return nil
 }
 
@@ -933,6 +946,10 @@ func (pc *PriceCreate) createSpec() (*Price, *sqlgraph.CreateSpec) {
 	if value, ok := pc.mutation.GroupID(); ok {
 		_spec.SetField(price.FieldGroupID, field.TypeString, value)
 		_node.GroupID = &value
+	}
+	if value, ok := pc.mutation.Sequence(); ok {
+		_spec.SetField(price.FieldSequence, field.TypeInt64, value)
+		_node.Sequence = value
 	}
 	if nodes := pc.mutation.CostsheetIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{

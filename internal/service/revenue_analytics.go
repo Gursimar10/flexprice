@@ -4,8 +4,10 @@ import (
 	"context"
 
 	"github.com/flexprice/flexprice/internal/api/dto"
+	"github.com/flexprice/flexprice/internal/domain/events"
 	ierr "github.com/flexprice/flexprice/internal/errors"
 	"github.com/flexprice/flexprice/internal/interfaces"
+	"github.com/flexprice/flexprice/internal/types"
 	"github.com/shopspring/decimal"
 )
 
@@ -37,15 +39,21 @@ func (s *revenueAnalyticsService) GetDetailedCostAnalytics(
 			Mark(ierr.ErrValidation)
 	}
 
-	// 1. Fetch cost analytics using the costsheet usage tracking service
+	// 1. Fetch cost analytics. Behind a feature flag we now compute cost from
+	// the meter_usage table instead of the legacy costsheet_usage table.
 	var costAnalytics *dto.GetCostAnalyticsResponse
-	costAnalytics, err := s.costsheetUsageTrackingService.GetCostSheetUsageAnalytics(ctx, req)
+	var err error
+	if s.Config.FeatureFlag.IsMeterUsageEnabledForAnalytics(types.GetTenantID(ctx)) {
+		costAnalytics, err = s.costsheetUsageTrackingService.GetCostAnalyticsFromMeterUsage(ctx, req)
+	} else {
+		costAnalytics, err = s.costsheetUsageTrackingService.GetCostSheetUsageAnalytics(ctx, req)
+	}
 	if err != nil {
-		s.Logger.Warnw("failed to fetch cost analytics", "error", err)
+		s.Logger.Info(context.Background(), "failed to fetch cost analytics", "error", err)
 		costAnalytics = nil
 	}
 
-	// 2. Fetch revenue analytics from feature usage tracking
+	// 2. Fetch revenue analytics from feature/meter usage tracking
 	var revenueAnalytics *dto.GetUsageAnalyticsResponse
 	revenueReq := &dto.GetUsageAnalyticsRequest{
 		ExternalCustomerID: req.ExternalCustomerID,
@@ -53,9 +61,28 @@ func (s *revenueAnalyticsService) GetDetailedCostAnalytics(
 		StartTime:          req.StartTime,
 		EndTime:            req.EndTime,
 	}
-	revenueAnalytics, err = s.featureUsageTrackingService.GetDetailedUsageAnalyticsV2(ctx, revenueReq)
+	if s.Config.FeatureFlag.IsMeterUsageEnabledForAnalytics(types.GetTenantID(ctx)) {
+		meterUsageService := NewMeterUsageService(s.ServiceParams)
+		revenueAnalytics, err = meterUsageService.GetDetailedAnalytics(ctx, &events.MeterUsageDetailedAnalyticsParams{
+			TenantID:            types.GetTenantID(ctx),
+			EnvironmentID:       types.GetEnvironmentID(ctx),
+			ExternalCustomerID:  revenueReq.ExternalCustomerID,
+			ExternalCustomerIDs: revenueReq.ExternalCustomerIDs,
+			FeatureIDs:          revenueReq.FeatureIDs,
+			StartTime:           revenueReq.StartTime,
+			EndTime:             revenueReq.EndTime,
+			GroupBy:             revenueReq.GroupBy,
+			PropertyFilters:     revenueReq.PropertyFilters,
+			Sources:             revenueReq.Sources,
+			WindowSize:          revenueReq.WindowSize,
+			Expand:              revenueReq.Expand,
+			IncludeChildren:     revenueReq.IncludeChildren,
+		})
+	} else {
+		revenueAnalytics, err = s.featureUsageTrackingService.GetDetailedUsageAnalyticsV2(ctx, revenueReq)
+	}
 	if err != nil {
-		s.Logger.Warnw("failed to fetch revenue analytics", "error", err)
+		s.Logger.Info(context.Background(), "failed to fetch revenue analytics", "error", err)
 		revenueAnalytics = nil
 	}
 

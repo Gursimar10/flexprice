@@ -1,6 +1,8 @@
 package cache
 
 import (
+	"context"
+
 	"github.com/flexprice/flexprice/internal/config"
 	"github.com/flexprice/flexprice/internal/logger"
 )
@@ -18,13 +20,13 @@ const (
 
 // Initialize initializes the cache system based on the specified type
 func Initialize(config *config.Configuration, log *logger.Logger) Cache {
-	log.Info("Initializing cache system", "type", config.Cache.Type)
+	log.Info(context.Background(), "Initializing cache system", "type", config.Cache.Type)
 
 	var cache Cache
 
 	switch CacheType(config.Cache.Type) {
 	case CacheTypeRedis:
-		InitializeRedisCache()
+		InitializeRedisCache(config, log)
 		cache = GetRedisCache()
 	case CacheTypeInMemory:
 		fallthrough
@@ -33,6 +35,6 @@ func Initialize(config *config.Configuration, log *logger.Logger) Cache {
 		cache = GetInMemoryCache()
 	}
 
-	log.Info("Cache system initialized", "type", config.Cache.Type)
+	log.Info(context.Background(), "Cache system initialized", "type", config.Cache.Type)
 	return cache
 }

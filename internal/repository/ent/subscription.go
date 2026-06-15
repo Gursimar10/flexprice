@@ -20,6 +20,7 @@ import (
 	"github.com/flexprice/flexprice/internal/postgres"
 	"github.com/flexprice/flexprice/internal/types"
 	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
 )
 
 type subscriptionRepository struct {
@@ -79,6 +80,7 @@ func (r *subscriptionRepository) Create(ctx context.Context, sub *domainSub.Subs
 		SetBillingCycle(sub.BillingCycle).
 		SetNillableCommitmentAmount(sub.CommitmentAmount).
 		SetNillableOverageFactor(sub.OverageFactor).
+		SetNillableAutoInvoiceThreshold(sub.AutoInvoiceThreshold).
 		SetNillableCommitmentDuration(sub.CommitmentDuration).
 		SetStatus(string(sub.Status)).
 		SetCreatedBy(sub.CreatedBy).
@@ -87,6 +89,7 @@ func (r *subscriptionRepository) Create(ctx context.Context, sub *domainSub.Subs
 		SetCustomerTimezone(sub.CustomerTimezone).
 		SetProrationBehavior(sub.ProrationBehavior).
 		SetVersion(1).
+		SetMetadata(sub.Metadata).
 		SetPaymentBehavior(types.PaymentBehavior(sub.PaymentBehavior)).
 		SetCollectionMethod(types.CollectionMethod(sub.CollectionMethod)).
 		SetNillableGatewayPaymentMethodID(sub.GatewayPaymentMethodID).
@@ -94,6 +97,7 @@ func (r *subscriptionRepository) Create(ctx context.Context, sub *domainSub.Subs
 		SetNillableInvoicingCustomerID(sub.InvoicingCustomerID).
 		SetNillableParentSubscriptionID(sub.ParentSubscriptionID).
 		SetNillablePaymentTerms(sub.PaymentTerms).
+		SetSyncedPriceSequence(sub.SyncedPriceSequence).
 		Save(ctx)
 
 	if err != nil {
@@ -230,7 +234,7 @@ func (r *subscriptionRepository) Update(ctx context.Context, sub *domainSub.Subs
 	_, err := query.Save(ctx)
 	if err != nil {
 		SetSpanError(span, err)
-		r.logger.Errorw("failed to update subscription", "error", err, "subscription_id", sub.ID)
+		r.logger.Error(ctx, "failed to update subscription", "error", err, "subscription_id", sub.ID)
 		return ierr.WithError(err).
 			WithHint("Failed to update subscription").
 			Mark(ierr.ErrDatabase)
@@ -281,7 +285,7 @@ func (r *subscriptionRepository) Delete(ctx context.Context, id string) error {
 
 // List retrieves a list of subscriptions based on the provided filter
 func (r *subscriptionRepository) List(ctx context.Context, filter *types.SubscriptionFilter) ([]*domainSub.Subscription, error) {
-	r.logger.Debugw("listing subscriptions", "filter", filter)
+	r.logger.Debug(ctx, "listing subscriptions", "filter", filter)
 
 	if filter == nil {
 		filter = &types.SubscriptionFilter{
@@ -329,7 +333,7 @@ func (r *subscriptionRepository) List(ctx context.Context, filter *types.Subscri
 	subs, err := query.All(ctx)
 	if err != nil {
 		SetSpanError(span, err)
-		r.logger.Errorw("failed to list subscriptions", "error", err)
+		r.logger.Error(ctx, "failed to list subscriptions", "error", err)
 		return nil, fmt.Errorf("listing subscriptions: %w", err)
 	}
 
@@ -344,22 +348,22 @@ func (r *subscriptionRepository) List(ctx context.Context, filter *types.Subscri
 }
 
 // ListActiveSubscriptionsDueForRenewal retrieves all active subscriptions that are due for renewal in 24 hours
-func (r *subscriptionRepository) ListSubscriptionsDueForRenewal(ctx context.Context) ([]*domainSub.Subscription, error) {
-	now := time.Now().UTC()
-	targetTime := now.Add(24 * time.Hour)
+func (r *subscriptionRepository) ListSubscriptionsDueForRenewal(ctx context.Context, referenceTime time.Time) ([]*domainSub.Subscription, error) {
+	referenceTime = referenceTime.UTC()
+	targetTime := referenceTime.Add(24 * time.Hour)
 
-	// Create a 5-minute window around the target time
-	windowStart := targetTime.Add(-1 * time.Hour)
-	windowEnd := targetTime.Add(1 * time.Hour)
+	// Half-open window [targetTime-15m, targetTime) matches the 15-minute
+	// schedule interval exactly. The workflow passes its scheduled start
+	// time, so each run covers a non-overlapping 15-minute slice.
+	windowStart := targetTime.Add(-15 * time.Minute)
 
-	// Find subscriptions ending exactly at the target time
 	subs, err := r.client.Reader(ctx).Subscription.Query().
 		Where(
 			subscription.And(
 				subscription.SubscriptionStatusEQ(types.SubscriptionStatusActive),
 				subscription.StatusEQ(string(types.StatusPublished)),
 				subscription.CurrentPeriodEndGTE(windowStart),
-				subscription.CurrentPeriodEndLTE(windowEnd),
+				subscription.CurrentPeriodEndLT(targetTime),
 				subscription.CancelAtPeriodEndEQ(false),
 			),
 		).All(ctx)
@@ -394,7 +398,7 @@ func (r *subscriptionRepository) ListAll(ctx context.Context, filter *types.Subs
 // GetSubscriptionsForBillingPeriodUpdate lists subscriptions across all tenants for billing-period
 // maintenance (cron/Temporal). NOTE: expensive; intended for scheduled jobs only.
 func (r *subscriptionRepository) GetSubscriptionsForBillingPeriodUpdate(ctx context.Context, filter *types.SubscriptionFilter) ([]*domainSub.Subscription, error) {
-	r.logger.Debugw("listing subscriptions for billing period update", "filter", filter)
+	r.logger.Debug(ctx, "listing subscriptions for billing period update", "filter", filter)
 
 	// Start a span for this repository operation
 	span := StartRepositorySpan(ctx, "subscription", "get_subscriptions_for_billing_period_update", map[string]interface{}{
@@ -433,7 +437,7 @@ func (r *subscriptionRepository) GetSubscriptionsForBillingPeriodUpdate(ctx cont
 	subs, err := query.All(ctx)
 	if err != nil {
 		SetSpanError(span, err)
-		r.logger.Errorw("failed to list subscriptions", "error", err)
+		r.logger.Error(ctx, "failed to list subscriptions", "error", err)
 		return nil, fmt.Errorf("listing subscriptions: %w", err)
 	}
 
@@ -449,7 +453,7 @@ func (r *subscriptionRepository) GetSubscriptionsForBillingPeriodUpdate(ctx cont
 
 // Count returns the total number of subscriptions based on the provided filter
 func (r *subscriptionRepository) Count(ctx context.Context, filter *types.SubscriptionFilter) (int, error) {
-	r.logger.Debugw("starting subscription repository Count",
+	r.logger.Debug(ctx, "starting subscription repository Count",
 		"filter", filter,
 		"tenant_id", types.GetTenantID(ctx),
 		"environment_id", types.GetEnvironmentID(ctx))
@@ -761,6 +765,7 @@ func (r *subscriptionRepository) CreateWithLineItems(ctx context.Context, sub *d
 				SetCommitmentTrueUpEnabled(item.CommitmentTrueUpEnabled).
 				SetCommitmentWindowed(item.CommitmentWindowed).
 				SetNillableCommitmentDuration(item.CommitmentDuration).
+				SetCommitmentTimeBuckets(item.CommitmentTimeBuckets).
 				SetMetadata(item.Metadata).
 				SetTenantID(item.TenantID).
 				SetEnvironmentID(item.EnvironmentID).
@@ -1091,7 +1096,7 @@ func (r *subscriptionRepository) DeleteCache(ctx context.Context, subID string) 
 
 // ListByCustomerID retrieves all active subscriptions for a customer and includes line items
 func (r *subscriptionRepository) ListByCustomerID(ctx context.Context, customerID string) ([]*domainSub.Subscription, error) {
-	r.logger.Debugw("listing subscriptions by customer ID",
+	r.logger.Debug(ctx, "listing subscriptions by customer ID",
 		"customer_id", customerID)
 
 	// Create a filter with customer ID
@@ -1159,4 +1164,38 @@ func (r *subscriptionRepository) GetRecentSubscriptionsByPlan(ctx context.Contex
 
 	SetSpanSuccess(span)
 	return results, nil
+}
+
+// GetSubscriptionsWithAutoInvoiceThreshold returns active, published subscriptions (paginated)
+// where auto_invoice_threshold is set directly on the subscription.
+// this runs without the tenant and environment filters applied,only use this for auto invoice threshold billing.
+func (r *subscriptionRepository) GetSubscriptionsWithAutoInvoiceThreshold(ctx context.Context, limit, offset int) ([]*domainSub.Subscription, error) {
+
+	subs, err := r.client.Reader(ctx).Subscription.Query().
+		Where(
+			subscription.Status(string(types.StatusPublished)),
+			subscription.SubscriptionStatusEQ(types.SubscriptionStatusActive),
+			subscription.AutoInvoiceThresholdNotNil(),
+			subscription.AutoInvoiceThresholdGT(decimal.Zero),
+		).
+		Order(ent.Asc(subscription.FieldID)).
+		Limit(limit).
+		Offset(offset).
+		All(ctx)
+	if err != nil {
+		return nil, ierr.WithError(err).
+			WithHint("Failed to fetch threshold subscriptions").
+			Mark(ierr.ErrDatabase)
+	}
+
+	if len(subs) == 0 {
+		return []*domainSub.Subscription{}, nil
+	}
+
+	result := make([]*domainSub.Subscription, len(subs))
+	for i, sub := range subs {
+		result[i] = domainSub.GetSubscriptionFromEnt(sub)
+	}
+
+	return result, nil
 }
