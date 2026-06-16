@@ -200,6 +200,12 @@ type CreditAdjustmentService interface {
 	ApplyCreditsToInvoice(ctx context.Context, inv *invoice.Invoice) (*dto.CreditAdjustmentResult, error)
 }
 
+// CheckoutService is the subset of the checkout service the webhook layer needs.
+// The concrete *checkoutService in internal/service satisfies this.
+type CheckoutService interface {
+	Complete(ctx context.Context, checkoutID string) error
+}
+
 type ServiceDependencies struct {
 	CustomerService                 CustomerService
 	PaymentService                  PaymentService
@@ -209,5 +215,6 @@ type ServiceDependencies struct {
 	EntityIntegrationMappingService EntityIntegrationMappingService
 	PriceUnitService                PriceUnitService
 	CreditAdjustmentService         CreditAdjustmentService
+	CheckoutService                 CheckoutService
 	DB                              postgres.IClient
 }
