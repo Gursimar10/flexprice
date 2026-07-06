@@ -10,6 +10,7 @@ import (
 	"github.com/flexprice/flexprice/internal/domain/connection"
 	"github.com/flexprice/flexprice/internal/domain/entityintegrationmapping"
 	ierr "github.com/flexprice/flexprice/internal/errors"
+	"github.com/flexprice/flexprice/internal/integration/registry"
 	"github.com/flexprice/flexprice/internal/logger"
 	temporalmodels "github.com/flexprice/flexprice/internal/temporal/models"
 	temporalservice "github.com/flexprice/flexprice/internal/temporal/service"
@@ -158,11 +159,54 @@ func DispatchInvoiceVendorSync(
 		}
 	}
 
+	// Generic registry-driven providers (new pipeline). This coexists with the hardcoded
+	// triggers above: registry providers are never in that slice, so no invoice is
+	// dispatched twice. When migrating a legacy provider, remove its hardcoded trigger in
+	// the same change that registers it here.
+	for _, p := range registry.ProvidersWithCapability(registry.CapabilityInvoiceSync) {
+		if err := triggerGenericInvoiceSync(ctx, connRepo, eimRepo, temporalSvc, log, p, in); err != nil {
+			dispatchErrs = append(dispatchErrs, err)
+		}
+	}
+
 	if len(dispatchErrs) > 0 {
 		return fmt.Errorf("integration_events: one or more provider dispatches failed for invoice %s: %w", in.InvoiceID, errors.Join(dispatchErrs...))
 	}
 
 	return nil
+}
+
+// triggerGenericInvoiceSync runs the registry-driven invoice sync for one provider.
+// It mirrors the guards of the hardcoded triggerXIfEnabled functions but is provider-agnostic.
+func triggerGenericInvoiceSync(
+	ctx context.Context,
+	connRepo connection.Repository,
+	eimRepo entityintegrationmapping.Repository,
+	temporalSvc temporalservice.TemporalService,
+	log *logger.Logger,
+	p registry.Provider,
+	in invoiceVendorSyncInput,
+) error {
+	conn, err := getConnectionIfExists(ctx, connRepo, p.Type)
+	if err != nil {
+		return err
+	}
+	if conn == nil || !conn.IsInvoiceOutboundEnabled() {
+		return nil
+	}
+	if invoiceAlreadySynced(ctx, eimRepo, in.InvoiceID, p.Type) {
+		log.Info(ctx, "integration_events: invoice already synced, skipping",
+			"provider", p.Type, "invoice_id", in.InvoiceID)
+		return nil
+	}
+
+	input := temporalmodels.IntegrationInvoiceSyncWorkflowInput{
+		Provider:      p.Type,
+		InvoiceID:     in.InvoiceID,
+		TenantID:      in.TenantID,
+		EnvironmentID: in.EnvironmentID,
+	}
+	return executeWorkflow(ctx, temporalSvc, log, types.TemporalIntegrationInvoiceSyncWorkflow, input, p.Type, in.InvoiceID)
 }
 
 // DispatchCustomerVendorSync starts Temporal customer-sync workflows for each enabled provider.

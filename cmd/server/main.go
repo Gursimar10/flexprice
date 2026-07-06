@@ -45,6 +45,7 @@ import (
 	"github.com/flexprice/flexprice/internal/domain/proration"
 	syncExport "github.com/flexprice/flexprice/internal/ee/service/sync/export"
 	"github.com/flexprice/flexprice/internal/integration"
+	"github.com/flexprice/flexprice/internal/integration/providers"
 	"github.com/flexprice/flexprice/internal/interfaces"
 	"github.com/flexprice/flexprice/internal/security"
 	"github.com/gin-gonic/gin"
@@ -71,6 +72,10 @@ func init() {
 }
 
 func main() {
+	// Register integration providers on the generic pipeline before wiring the app.
+	// Runs in every deployment mode; deterministic (not init-time side effects).
+	providers.RegisterAll()
+
 	// Initialize Fx application
 	var opts []fx.Option
 
